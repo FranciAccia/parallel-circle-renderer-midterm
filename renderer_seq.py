@@ -561,7 +561,7 @@ def render_parallel_tiles_aos(
     num_threads: int | None = None,
 ) -> np.ndarray:
     """Come `render_parallel_tiles`, ma con layout AoS.
-    Usata solo da benchmark_plots.py (non e' un mode della CLI)."""
+    Usata solo da benchmark_plots.py (non e' in RENDERERS)."""
     if num_threads is not None:
         nt = max(1, min(int(num_threads), numba.config.NUMBA_NUM_THREADS))
         numba.set_num_threads(nt)
