@@ -1,0 +1,19 @@
+# Ambiente virtuale Python
+.venv/
+
+# Cache di Python e dei kernel compilati da Numba (*.nbi, *.nbc)
+__pycache__/
+*.pyc
+
+# File temporanei di LaTeX (il PDF della relazione invece si versiona)
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz
+*.fls
+*.fdb_latexmk
+
+# File di sistema e dell'IDE
+.DS_Store
+.idea/
