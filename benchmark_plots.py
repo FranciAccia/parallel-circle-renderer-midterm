@@ -1,16 +1,14 @@
 from __future__ import annotations
 
 import functools
+import json
 import os
+import subprocess
+import sys
+import sysconfig
 import time
 
-# Numero massimo di thread Numba (2x i core logici). Va impostato qui, prima
-# di importare numba: questo file importa numba prima di renderer_seq.
-if "NUMBA_NUM_THREADS" not in os.environ:
-    os.environ["NUMBA_NUM_THREADS"] = str(2 * (os.cpu_count() or 1))
-
 import numpy as np
-import numba
 import matplotlib
 
 matplotlib.use("Agg")
@@ -22,7 +20,9 @@ from renderer_seq import (
 )
 
 
-MAX_THREADS = numba.config.NUMBA_NUM_THREADS
+# Numero massimo di thread: 2x i core logici disponibili al processo, per misurare
+# anche l'oversubscription.
+MAX_THREADS = 2 * (os.process_cpu_count() or 1)
 WARMUP = 2       # esecuzioni di riscaldamento, escluse dalla misura
 ITERATIONS = 5   # esecuzioni misurate per ogni configurazione
 
@@ -35,7 +35,7 @@ def time_render(render_fn, circles, resolution, threads, warmup, iterations,
     Ritorna (media, min, max, std, media_cpu, ci95) in ms, dove ci95 e'
     l'intervallo di confidenza al 95%: 1.96 * std / sqrt(n).
     """
-    numba.set_num_threads(max(1, min(threads, MAX_THREADS)))
+    render_fn = functools.partial(render_fn, num_threads=threads)
 
     for _ in range(warmup):
         render_fn(circles, resolution)
@@ -62,6 +62,40 @@ def time_render(render_fn, circles, resolution, threads, warmup, iterations,
             float(cpu_ms.mean()), float(ci95))
 
 
+def gil_enabled() -> bool:
+    """True se il GIL e' attivo (sempre True prima di Python 3.13)."""
+    return getattr(sys, "_is_gil_enabled", lambda: True)()
+
+
+def check_interpreter() -> None:
+    """Stampa l'interprete in uso e si ferma se il GIL e' attivo.
+
+    Il parallelismo del renderer richiede Python free-threaded (3.14t): con il
+    GIL i thread verrebbero eseguiti uno alla volta e le misure di scaling
+    non avrebbero senso.
+    """
+    free_threaded = bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
+    print(f"Python {sys.version.split()[0]}{getattr(sys, 'abiflags', '')}  "
+          f"build free-threaded: {free_threaded}  GIL attivo: {gil_enabled()}")
+    if not free_threaded or gil_enabled():
+        raise SystemExit(
+            "ERRORE: serve Python 3.14 free-threaded con il GIL disattivato.\n"
+            "Lanciare con:  uv run python benchmark_plots.py")
+
+
+def gil_worker(gil: int, threads: list[int], warmup: int, iterations: int) -> None:
+    """Eseguito in un sottoprocesso (esperimento 8), con il GIL attivo o no.
+
+    Misura `simd` per ogni numero di thread e stampa i tempi come JSON
+    sull'ultima riga, letta dal processo principale.
+    """
+    res, n = 1024, 4000
+    circ = generate_dataset(resolution=res, n=n, seed=42)
+    fn = make_fn("simd", tile=64)
+    times = [time_render(fn, circ, res, t, warmup, iterations)[0] for t in threads]
+    print(json.dumps({"gil": gil, "gil_enabled": gil_enabled(), "times_ms": times}))
+
+
 def make_fn(mode, tile):
     fn = RENDERERS[mode]
     if mode in ("tiles", "simd"):
@@ -76,15 +110,14 @@ def check_correctness(tol: float = 1e-3) -> None:
     risultati possono differire negli ultimi bit. Oltre all'immagine quadrata
     si prova un'immagine rettangolare con lati non multipli della tile.
     """
-    print("[0/7] verifica correttezza ...")
+    print("[0/8] verifica correttezza ...")
     for res in (512, (1000, 700)):
         circ = generate_dataset(resolution=res, n=2000, seed=7)
-        numba.set_num_threads(MAX_THREADS)
         ref = render(circ, res)
         fns = {mode: make_fn(mode, tile=64) for mode in ("pixels", "tiles", "simd")}
         fns["tiles_aos"] = functools.partial(render_parallel_tiles_aos, tile=64)
         for name, fn in fns.items():
-            err = float(np.abs(fn(circ, res) - ref).max())
+            err = float(np.abs(fn(circ, res, num_threads=MAX_THREADS) - ref).max())
             label = res if isinstance(res, int) else f"{res[0]}x{res[1]}"
             print(f"    {name:9s} {label} -> errore max {err:.1e}")
             if err > tol:
@@ -110,7 +143,7 @@ def run_all(warmup: int, iterations: int) -> dict:
 
     # --- 1. scaling vs thread ----------------------------------------------
     # Dataset grande (100.000 cerchi) perché il sequenziale duri almeno 10 s.
-    print("[1/7] scaling vs thread ...")
+    print("[1/8] scaling vs thread ...")
     # Se il tempo sequenziale stampato scende sotto 10 s, aumentare n e n_max.
     res, n, n_max = 2048, 100_000, 100_000
     circ = generate_dataset(resolution=res, n=n, n_max=n_max, seed=42)
@@ -152,7 +185,7 @@ def run_all(warmup: int, iterations: int) -> dict:
     results["scaling"] = scaling
 
     # --- 2. tempo vs risoluzione: 3000 cerchi, max thread ----------------
-    print("[2/7] tempo vs risoluzione ...")
+    print("[2/8] tempo vs risoluzione ...")
     n = 3000
     rres = {"circles": n, "threads": MAX_THREADS, "resolutions": resolutions, "modes": {}}
     for mode in ("seq", "tiles", "simd"):
@@ -168,7 +201,7 @@ def run_all(warmup: int, iterations: int) -> dict:
     results["resolution"] = rres
 
     # --- 3. tempo vs numero di cerchi: 1024x1024, max thread ------------
-    print("[3/7] tempo vs numero cerchi ...")
+    print("[3/8] tempo vs numero cerchi ...")
     res = 1024
     cres = {"resolution": res, "threads": MAX_THREADS,
             "counts": circle_counts, "modes": {}}
@@ -185,7 +218,7 @@ def run_all(warmup: int, iterations: int) -> dict:
     results["circles"] = cres
 
     # --- 4. tempo vs dimensione tile: 1024x1024, 4000 cerchi -----------
-    print("[4/7] tempo vs dimensione tile ...")
+    print("[4/8] tempo vs dimensione tile ...")
     res, n = 1024, 4000
     circ = generate_dataset(resolution=res, n=n, seed=42)
     tres = {"resolution": res, "circles": n, "threads": MAX_THREADS,
@@ -201,7 +234,7 @@ def run_all(warmup: int, iterations: int) -> dict:
     results["tile"] = tres
 
     # --- 5. effetto SIMD: tiles vs simd a vari thread -----------------
-    print("[5/7] effetto SIMD ...")
+    print("[5/8] effetto SIMD ...")
     res, n = 1024, 4000
     circ = generate_dataset(resolution=res, n=n, seed=42)
     sres = {"resolution": res, "circles": n, "threads": thread_list, "modes": {}}
@@ -218,7 +251,7 @@ def run_all(warmup: int, iterations: int) -> dict:
     results["simd"] = sres
 
     # --- 6. memory layout: SoA vs AoS -----------------------------------
-    print("[6/7] memory layout: SoA vs AoS ...")
+    print("[6/8] memory layout: SoA vs AoS ...")
     res_list = [512, 1024, 2048]
     n_fixed = 3000
     mres = {"circles": n_fixed, "threads": MAX_THREADS, "resolutions": res_list,
@@ -235,7 +268,7 @@ def run_all(warmup: int, iterations: int) -> dict:
     results["memory_layout"] = mres
 
     # --- 7. weak scaling: lavoro per thread costante ---------------------
-    print("[7/7] weak scaling ...")
+    print("[7/8] weak scaling ...")
     res = 1024
     base_n = 500
     fn = make_fn("simd", tile=64)
@@ -252,6 +285,27 @@ def run_all(warmup: int, iterations: int) -> dict:
         wres["efficiency"].append(eff)
         print(f"    t={t:<2d} n={n_t:<6d} -> {mean:8.1f} ms  (eff={eff:.2f})")
     results["weak_scaling"] = wres
+
+    # --- 8. GIL vs free-threading ----------------------------------------
+    # Stesso codice e stesso interprete, lanciato due volte in un
+    # sottoprocesso: con -X gil=0 (free-threading) e con -X gil=1 (GIL
+    # riattivato). Cambia solo la presenza del GIL.
+    print("[8/8] GIL vs free-threading ...")
+    here = os.path.dirname(os.path.abspath(__file__))
+    gres = {"resolution": 1024, "circles": 4000, "threads": thread_list, "modes": {}}
+    for gil in (0, 1):
+        code = (f"import benchmark_plots as b; "
+                f"b.gil_worker({gil}, {thread_list}, {warmup}, {iterations})")
+        out = subprocess.run([sys.executable, "-X", f"gil={gil}", "-c", code],
+                             cwd=here, capture_output=True, text=True, check=True)
+        data = json.loads(out.stdout.strip().splitlines()[-1])
+        if bool(data["gil_enabled"]) != bool(gil):
+            raise SystemExit(f"ERRORE: con -X gil={gil} il GIL attivo e' {data['gil_enabled']}")
+        key = "gil" if gil else "free_threaded"
+        gres["modes"][key] = data["times_ms"]
+        for t, ms in zip(thread_list, data["times_ms"]):
+            print(f"    {'GIL attivo' if gil else 'senza GIL'} t={t:<2d} -> {ms:8.1f} ms")
+    results["gil"] = gres
 
     return results
 
@@ -480,9 +534,40 @@ def plot_weak_scaling(d, path):
     plt.close(fig)
 
 
+def plot_gil(d, path):
+    if "gil" not in d:
+        return
+    g = d["gil"]
+    threads = g["threads"]
+    styles = {
+        "free_threaded": dict(color=MODE_STYLE["simd"]["color"], marker="D",
+                              label="Python 3.14t, senza GIL (-X gil=0)"),
+        "gil":           dict(color=MODE_STYLE["pixels"]["color"], marker="s",
+                              label="stesso interprete, GIL attivo (-X gil=1)"),
+    }
+
+    fig, ax = plt.subplots(1, 2, figsize=(12, 4.6))
+    for key, row in g["modes"].items():
+        ax[0].plot(threads, row, **styles[key])
+        ax[1].plot(threads, [row[0] / v for v in row], **styles[key])
+    ax[0].set(xlabel="thread", ylabel="tempo [ms]",
+              title=f"simd: tempo  ({g['resolution']}², {g['circles']} cerchi)")
+    ax[1].plot(threads, threads, "k:", alpha=.5, label="ideale (lineare)")
+    ax[1].set(xlabel="thread", ylabel="speedup  (T(1) / T(p))",
+              title="Speedup con e senza GIL")
+    for a in ax:
+        a.grid(True, alpha=.3)
+        a.legend()
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+
+
 # ---------------------------------------------------------------------------
 def main():
     t0 = time.perf_counter()
+    check_interpreter()
     check_correctness()
     results = run_all(WARMUP, ITERATIONS)
     print(f"\nBenchmark completato in {time.perf_counter() - t0:.1f} s")
@@ -496,6 +581,7 @@ def main():
     plot_simd(results, "figures/bench_simd.png")
     plot_aos_vs_soa(results, "figures/bench_memory_layout.png")
     plot_weak_scaling(results, "figures/bench_weak_scaling.png")
+    plot_gil(results, "figures/bench_gil.png")
 
 
 if __name__ == "__main__":

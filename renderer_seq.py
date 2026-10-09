@@ -1,8 +1,14 @@
 """
 Renderer 2D di cerchi con profondita' Z, in quattro versioni:
-seq (sequenziale), pixels, tiles e simd (parallele con Numba).
+seq (sequenziale), pixels, tiles e simd (parallele).
 
 I cerchi sono salvati come Structure of Arrays (un array per attributo).
+
+Parallelismo: il codice gira su Python 3.14 free-threaded (3.14t), che non ha
+il GIL. Il lavoro (righe o tile) viene diviso tra piu' thread Python di un
+ThreadPoolExecutor, che eseguono lo stesso kernel Numba in contemporanea su
+parti diverse dell'immagine. Con il GIL attivo gli stessi thread verrebbero
+eseguiti uno alla volta (vedi esperimento 8 in benchmark_plots.py).
 
 Regole di rendering (uguali per tutti i kernel):
   * i cerchi si disegnano per Z crescente: quelli con Z maggiore stanno sopra;
@@ -14,15 +20,10 @@ Regole di rendering (uguali per tutti i kernel):
 from __future__ import annotations
 
 import os
-
-# Numero massimo di thread Numba: va impostato prima di importare numba.
-# Usiamo 2x i core logici per poter misurare anche l'oversubscription.
-if "NUMBA_NUM_THREADS" not in os.environ:
-    os.environ["NUMBA_NUM_THREADS"] = str(2 * (os.cpu_count() or 1))
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
-import numba
-from numba import njit, prange
+from numba import njit
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +79,42 @@ def _as_wh(resolution) -> tuple[int, int]:
         return int(resolution), int(resolution)
     w, h = resolution
     return int(w), int(h)
+
+
+def _n_tiles(w: int, h: int, tile: int) -> int:
+    """Numero di tile di lato `tile` necessari a coprire un'immagine w x h."""
+    return ((w + tile - 1) // tile) * ((h + tile - 1) // tile)
+
+
+# ---------------------------------------------------------------------------
+# Esecuzione parallela con thread Python (free-threading)
+# ---------------------------------------------------------------------------
+_POOLS: dict[int, ThreadPoolExecutor] = {}
+
+
+def _run_parallel(kernel, args, n_items: int, num_threads: int | None) -> None:
+    """Esegue `kernel(*args, start, step)` su `num_threads` thread Python.
+
+    Il thread k elabora gli elementi k, k+nt, k+2nt, ... (righe o tile):
+    la distribuzione a salti bilancia il carico tra le zone dell'immagine.
+    Su Python free-threaded i thread girano davvero in parallelo, su core
+    diversi; con il GIL attivo verrebbero serializzati. I pool vengono
+    riusati tra una chiamata e l'altra, cosi' il costo di creazione dei
+    thread non entra nelle misure.
+    num_threads: None = numero di core logici.
+    """
+    if num_threads is None:
+        num_threads = os.process_cpu_count() or 1
+    nt = max(1, min(int(num_threads), n_items))
+    if nt == 1:
+        kernel(*args, 0, 1)
+        return
+    pool = _POOLS.get(nt)
+    if pool is None:
+        pool = _POOLS[nt] = ThreadPoolExecutor(max_workers=nt)
+    futures = [pool.submit(kernel, *args, k, nt) for k in range(nt)]
+    for f in futures:
+        f.result()  # attende la fine e rilancia eventuali eccezioni
 
 
 # ---------------------------------------------------------------------------
@@ -182,8 +219,14 @@ def _render_kernel(img, x, y, z, radius, cr, cg, cb, ca):
 # ---------------------------------------------------------------------------
 # Versione sequenziale
 # ---------------------------------------------------------------------------
-def render(circles: CircleSoA, resolution=512, background=(1.0, 1.0, 1.0)) -> np.ndarray:
-    """Versione sequenziale. Ritorna un'immagine float32 (H, W, 3) in [0, 1]."""
+def render(
+    circles: CircleSoA,
+    resolution=512,
+    background=(1.0, 1.0, 1.0),
+    num_threads: int | None = None,
+) -> np.ndarray:
+    """Versione sequenziale. Ritorna un'immagine float32 (H, W, 3) in [0, 1].
+    num_threads e' ignorato: c'e' solo per avere la stessa firma delle altre."""
     w, h = _as_wh(resolution)
 
     img = np.empty((h, w, 3), dtype=np.float32)
@@ -199,11 +242,11 @@ def render(circles: CircleSoA, resolution=512, background=(1.0, 1.0, 1.0)) -> np
 # ---------------------------------------------------------------------------
 # Kernel parallelo sulle righe (pixels)
 # ---------------------------------------------------------------------------
-@njit(parallel=True, cache=True, fastmath=True)
+@njit(cache=True, fastmath=True)
 def _render_kernel_parallel_pixels(
-    img, x, y, z, radius, cr, cg, cb, ca, bg0, bg1, bg2
+    img, x, y, z, radius, cr, cg, cb, ca, bg0, bg1, bg2, start, step
 ):
-    """Parallelo sulle righe dell'immagine.
+    """Parallelo sulle righe dell'immagine: disegna le righe start, start+step, ...
 
     Ogni thread scrive righe diverse, quindi non servono lock. Per ogni pixel
     si controllano TUTTI i cerchi (nessun culling): per questo e' lento.
@@ -212,7 +255,7 @@ def _render_kernel_parallel_pixels(
     w = img.shape[1]
     n = x.shape[0]
 
-    for j in prange(h):                 # righe divise tra i thread
+    for j in range(start, h, step):     # righe di questo thread
         py = j + 0.5
         for i in range(w):
             px = i + 0.5
@@ -249,30 +292,28 @@ def render_parallel_pixels(
     num_threads: int | None = None,
 ) -> np.ndarray:
     """Come `render`, con il kernel parallelo sulle righe.
-    num_threads: thread da usare (limitato a [1, NUMBA_NUM_THREADS])."""
-    if num_threads is not None:
-        n = max(1, min(int(num_threads), numba.config.NUMBA_NUM_THREADS))
-        numba.set_num_threads(n)
-
+    num_threads: thread da usare (None = numero di core logici)."""
     w, h = _as_wh(resolution)
     img = np.empty((h, w, 3), dtype=np.float32)
 
     s = circles.sorted_by_z()
-    _render_kernel_parallel_pixels(
+    args = (
         img, s.x, s.y, s.z, s.radius, s.r, s.g, s.b, s.a,
         np.float32(background[0]), np.float32(background[1]), np.float32(background[2]),
     )
+    _run_parallel(_render_kernel_parallel_pixels, args, h, num_threads)
     return img
 
 
 # ---------------------------------------------------------------------------
 # Kernel parallelo a tile (tiles)
 # ---------------------------------------------------------------------------
-@njit(parallel=True, cache=True, fastmath=True)
+@njit(cache=True, fastmath=True)
 def _render_kernel_parallel_tiles(
-    img, x, y, z, radius, cr, cg, cb, ca, bg0, bg1, bg2, tile
+    img, x, y, z, radius, cr, cg, cb, ca, bg0, bg1, bg2, tile, start, step
 ):
-    """Parallelo su blocchi quadrati (tile) di lato `tile`.
+    """Parallelo su blocchi quadrati (tile) di lato `tile`: disegna i tile
+    start, start+step, ...
 
     Ogni thread lavora su tile diversi, quindi non servono lock. Per ogni tile:
       1. si selezionano i cerchi che toccano il tile (culling);
@@ -286,7 +327,7 @@ def _render_kernel_parallel_tiles(
     n_ty = (h + tile - 1) // tile
     n_tiles = n_tx * n_ty
 
-    for t in prange(n_tiles):              # tile divisi tra i thread
+    for t in range(start, n_tiles, step):  # tile di questo thread
         tx = t % n_tx
         ty = t // n_tx
 
@@ -346,21 +387,19 @@ def render_parallel_tiles(
     num_threads: int | None = None,
 ) -> np.ndarray:
     """Come `render`, con il kernel a tile.
-    tile: lato del tile in pixel; num_threads: thread da usare."""
-    if num_threads is not None:
-        nt = max(1, min(int(num_threads), numba.config.NUMBA_NUM_THREADS))
-        numba.set_num_threads(nt)
-
+    tile: lato del tile in pixel; num_threads: thread da usare
+    (None = numero di core logici)."""
     tile = max(1, int(tile))
     w, h = _as_wh(resolution)
     img = np.empty((h, w, 3), dtype=np.float32)
 
     s = circles.sorted_by_z()
-    _render_kernel_parallel_tiles(
+    args = (
         img, s.x, s.y, s.z, s.radius, s.r, s.g, s.b, s.a,
         np.float32(background[0]), np.float32(background[1]), np.float32(background[2]),
         np.int64(tile),
     )
+    _run_parallel(_render_kernel_parallel_tiles, args, _n_tiles(w, h, tile), num_threads)
     return img
 
 
@@ -375,9 +414,9 @@ def render_parallel_tiles(
 #     indipendente dagli altri;
 #   * il tile usa tre piccoli buffer contigui (R, G, B) che restano in cache;
 #   * fastmath=True permette al compilatore di usare FMA e riordinare i calcoli.
-@njit(parallel=True, cache=True, fastmath=True)
+@njit(cache=True, fastmath=True)
 def _render_kernel_tiles_simd(
-    img, x, y, z, radius, cr, cg, cb, ca, bg0, bg1, bg2, tile
+    img, x, y, z, radius, cr, cg, cb, ca, bg0, bg1, bg2, tile, start, step
 ):
     h = img.shape[0]
     w = img.shape[1]
@@ -390,7 +429,7 @@ def _render_kernel_tiles_simd(
 
     one = np.float32(1.0)
 
-    for t in prange(n_tiles):
+    for t in range(start, n_tiles, step):
         tx = t % n_tx
         ty = t // n_tx
         x0 = tx * tile
@@ -468,20 +507,17 @@ def render_tiles_simd(
     num_threads: int | None = None,
 ) -> np.ndarray:
     """Come `render_parallel_tiles`, con il kernel vettorizzato (SIMD)."""
-    if num_threads is not None:
-        nt = max(1, min(int(num_threads), numba.config.NUMBA_NUM_THREADS))
-        numba.set_num_threads(nt)
-
     tile = max(1, int(tile))
     w, h = _as_wh(resolution)
     img = np.empty((h, w, 3), dtype=np.float32)
 
     s = circles.sorted_by_z()
-    _render_kernel_tiles_simd(
+    args = (
         img, s.x, s.y, s.z, s.radius, s.r, s.g, s.b, s.a,
         np.float32(background[0]), np.float32(background[1]), np.float32(background[2]),
         np.int64(tile),
     )
+    _run_parallel(_render_kernel_tiles_simd, args, _n_tiles(w, h, tile), num_threads)
     return img
 
 
@@ -493,8 +529,8 @@ def render_tiles_simd(
 _AOS_X, _AOS_Y, _AOS_Z, _AOS_R, _AOS_CR, _AOS_CG, _AOS_CB, _AOS_CA = range(8)
 
 
-@njit(parallel=True, cache=True, fastmath=True)
-def _render_kernel_tiles_aos(img, flat, bg0, bg1, bg2, tile):
+@njit(cache=True, fastmath=True)
+def _render_kernel_tiles_aos(img, flat, bg0, bg1, bg2, tile, start, step):
     h = img.shape[0]
     w = img.shape[1]
     n = flat.shape[0]
@@ -503,7 +539,7 @@ def _render_kernel_tiles_aos(img, flat, bg0, bg1, bg2, tile):
     n_ty = (h + tile - 1) // tile
     n_tiles = n_tx * n_ty
 
-    for t in prange(n_tiles):
+    for t in range(start, n_tiles, step):
         tx = t % n_tx
         ty = t // n_tx
 
@@ -562,21 +598,18 @@ def render_parallel_tiles_aos(
 ) -> np.ndarray:
     """Come `render_parallel_tiles`, ma con layout AoS.
     Usata solo da benchmark_plots.py (non e' in RENDERERS)."""
-    if num_threads is not None:
-        nt = max(1, min(int(num_threads), numba.config.NUMBA_NUM_THREADS))
-        numba.set_num_threads(nt)
-
     tile = max(1, int(tile))
     w, h = _as_wh(resolution)
     img = np.empty((h, w, 3), dtype=np.float32)
 
     s = circles.sorted_by_z()
     flat = s.to_aos()
-    _render_kernel_tiles_aos(
+    args = (
         img, flat,
         np.float32(background[0]), np.float32(background[1]), np.float32(background[2]),
         np.int64(tile),
     )
+    _run_parallel(_render_kernel_tiles_aos, args, _n_tiles(w, h, tile), num_threads)
     return img
 
 

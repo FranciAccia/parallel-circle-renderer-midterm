@@ -1,0 +1,13 @@
+[project]
+name = "renderer-mid-term"
+version = "1.0.0"
+description = "Renderer 2D di cerchi parallelo: thread Python su Python 3.14 free-threaded (senza GIL) + Numba"
+requires-python = ">=3.14"
+dependencies = [
+    "numpy>=2.3",
+    "numba>=0.65",       # prima versione con supporto a Python 3.14t (free-threaded)
+    "matplotlib>=3.10",
+]
+
+[tool.uv]
+package = false

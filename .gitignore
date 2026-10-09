@@ -17,3 +17,6 @@ __pycache__/
 # File di sistema e dell'IDE
 .DS_Store
 .idea/
+
+# Cartella dei PDF delle lezioni (materiale del corso, non del progetto)
+ParallelDocs/
