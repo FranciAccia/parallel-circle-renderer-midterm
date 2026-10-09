@@ -81,7 +81,7 @@ pdflatex Relazione_RendererMidTerm.tex
 | # | Esperimento | Parametri | Grafico |
 |---|-------------|-----------|---------|
 | 0 | Verifica di correttezza | 512², 1000×700; 2000 cerchi; tolleranza 1e-3 | — |
-| 1 | Strong scaling | 2048², 100.000 cerchi; 1–16 thread | `bench_scaling.png` |
+| 1 | Strong scaling | 2048², 60.000 cerchi; 1–16 thread | `bench_scaling.png` |
 | 2 | Tempo vs risoluzione | 512², 1024², 2048²; 3000 cerchi | `bench_resolution.png` |
 | 3 | Tempo vs numero di cerchi | 1024²; 500–8000 cerchi | `bench_circles.png` |
 | 4 | Tempo vs dimensione tile | 1024², 4000 cerchi; tile 16–256 px | `bench_tile.png` |
@@ -99,8 +99,8 @@ solo da 4 thread in su, perché senza selezione dei cerchi sarebbe troppo lento.
 |-----------|--------|----------------|
 | Esecuzioni di riscaldamento (escluse dalla misura) | 2 | `WARMUP` in `benchmark_plots.py` |
 | Esecuzioni misurate per configurazione | 5 | `ITERATIONS` in `benchmark_plots.py` |
-| Numero massimo di thread | 2 × core logici (16 su Apple M2) | `MAX_THREADS` in `benchmark_plots.py` |
-| Dimensione tile di default | 64 px | argomento `tile` delle funzioni di render |
+| Numero massimo di thread | 2 × core logici (16 sul Ryzen 5 2400G) | `MAX_THREADS` in `benchmark_plots.py` |
+| Dimensione tile di default | 32 px | costante `TILE` in `renderer_seq.py` |
 
 Per ogni configurazione vengono misurati tempo reale (media, minimo, massimo, deviazione
 standard, intervallo di confidenza al 95%) e tempo CPU.
@@ -115,5 +115,9 @@ reale di cerchi con profondità e trasparenza da usare al suo posto.
 
 ## Ambiente di test
 
-MacBook Air Apple M2 (4 core performance + 4 core efficiency), macOS, Python 3.14.8 free-threaded.
+Server Linux (Debian 13, macchina virtuale Proxmox) con AMD Ryzen 5 2400G: 4 core fisici con
+SMT (8 core logici), AVX2/FMA, cache L1 dati da 32 KB per core; Python 3.14.8 free-threaded.
+I parametri dipendenti dalla macchina (tile da 32 px, 60.000 cerchi nell'esperimento 1) sono
+stati scelti misurando su questo server. Il codice gira anche su macOS (sviluppato su un
+MacBook Air M2).
 I risultati completi e la loro analisi sono nella relazione in `relazione/`.

@@ -81,6 +81,12 @@ def _as_wh(resolution) -> tuple[int, int]:
     return int(w), int(h)
 
 
+# Lato del tile di default, in pixel. Scelto misurando sulla macchina di test
+# (AMD Ryzen 5 2400G, cache L1 dati da 32 KB per core): con tile 32 i tre
+# buffer R/G/B del kernel simd occupano 12 KB e stanno interi in L1.
+TILE = 32
+
+
 def _n_tiles(w: int, h: int, tile: int) -> int:
     """Numero di tile di lato `tile` necessari a coprire un'immagine w x h."""
     return ((w + tile - 1) // tile) * ((h + tile - 1) // tile)
@@ -383,7 +389,7 @@ def render_parallel_tiles(
     circles: CircleSoA,
     resolution=512,
     background=(1.0, 1.0, 1.0),
-    tile: int = 64,
+    tile: int = TILE,
     num_threads: int | None = None,
 ) -> np.ndarray:
     """Come `render`, con il kernel a tile.
@@ -503,7 +509,7 @@ def render_tiles_simd(
     circles: CircleSoA,
     resolution=512,
     background=(1.0, 1.0, 1.0),
-    tile: int = 64,
+    tile: int = TILE,
     num_threads: int | None = None,
 ) -> np.ndarray:
     """Come `render_parallel_tiles`, con il kernel vettorizzato (SIMD)."""
@@ -593,7 +599,7 @@ def render_parallel_tiles_aos(
     circles: CircleSoA,
     resolution=512,
     background=(1.0, 1.0, 1.0),
-    tile: int = 64,
+    tile: int = TILE,
     num_threads: int | None = None,
 ) -> np.ndarray:
     """Come `render_parallel_tiles`, ma con layout AoS.

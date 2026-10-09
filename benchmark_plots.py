@@ -16,7 +16,7 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 
 from renderer_seq import (
-    RENDERERS, generate_dataset, render, render_parallel_tiles_aos,
+    RENDERERS, TILE, generate_dataset, render, render_parallel_tiles_aos,
 )
 
 
@@ -91,7 +91,7 @@ def gil_worker(gil: int, threads: list[int], warmup: int, iterations: int) -> No
     """
     res, n = 1024, 4000
     circ = generate_dataset(resolution=res, n=n, seed=42)
-    fn = make_fn("simd", tile=64)
+    fn = make_fn("simd", tile=TILE)
     times = [time_render(fn, circ, res, t, warmup, iterations)[0] for t in threads]
     print(json.dumps({"gil": gil, "gil_enabled": gil_enabled(), "times_ms": times}))
 
@@ -114,8 +114,8 @@ def check_correctness(tol: float = 1e-3) -> None:
     for res in (512, (1000, 700)):
         circ = generate_dataset(resolution=res, n=2000, seed=7)
         ref = render(circ, res)
-        fns = {mode: make_fn(mode, tile=64) for mode in ("pixels", "tiles", "simd")}
-        fns["tiles_aos"] = functools.partial(render_parallel_tiles_aos, tile=64)
+        fns = {mode: make_fn(mode, tile=TILE) for mode in ("pixels", "tiles", "simd")}
+        fns["tiles_aos"] = functools.partial(render_parallel_tiles_aos, tile=TILE)
         for name, fn in fns.items():
             err = float(np.abs(fn(circ, res, num_threads=MAX_THREADS) - ref).max())
             label = res if isinstance(res, int) else f"{res[0]}x{res[1]}"
@@ -142,10 +142,11 @@ def run_all(warmup: int, iterations: int) -> dict:
     }
 
     # --- 1. scaling vs thread ----------------------------------------------
-    # Dataset grande (100.000 cerchi) perché il sequenziale duri almeno 10 s.
+    # Dataset grande (60.000 cerchi) perché il sequenziale duri almeno 10 s
+    # (circa 13.5 s sul Ryzen 5 2400G).
     print("[1/8] scaling vs thread ...")
     # Se il tempo sequenziale stampato scende sotto 10 s, aumentare n e n_max.
-    res, n, n_max = 2048, 100_000, 100_000
+    res, n, n_max = 2048, 60_000, 60_000
     circ = generate_dataset(resolution=res, n=n, n_max=n_max, seed=42)
     base_ms, _, _, _, base_cpu_ms, base_ci = time_render(
         render, circ, res, 1, warmup, iterations, budget_s=90.0
@@ -162,7 +163,7 @@ def run_all(warmup: int, iterations: int) -> dict:
     res_pixels = 1024
 
     for mode in ("pixels", "tiles", "simd"):
-        fn = make_fn(mode, tile=64)
+        fn = make_fn(mode, tile=TILE)
         m_threads = [t for t in thread_list if t >= 4] if mode == "pixels" else thread_list
         row, ci_row = [], []
         for t in thread_list:
@@ -189,7 +190,7 @@ def run_all(warmup: int, iterations: int) -> dict:
     n = 3000
     rres = {"circles": n, "threads": MAX_THREADS, "resolutions": resolutions, "modes": {}}
     for mode in ("seq", "tiles", "simd"):
-        fn = make_fn(mode, tile=64)
+        fn = make_fn(mode, tile=TILE)
         row = []
         for r in resolutions:
             circ_r = generate_dataset(resolution=r, n=n, seed=42)
@@ -206,7 +207,7 @@ def run_all(warmup: int, iterations: int) -> dict:
     cres = {"resolution": res, "threads": MAX_THREADS,
             "counts": circle_counts, "modes": {}}
     for mode in ("seq", "tiles", "simd"):
-        fn = make_fn(mode, tile=64)
+        fn = make_fn(mode, tile=TILE)
         row = []
         for n in circle_counts:
             circ_n = generate_dataset(resolution=res, n=n, seed=42)
@@ -239,7 +240,7 @@ def run_all(warmup: int, iterations: int) -> dict:
     circ = generate_dataset(resolution=res, n=n, seed=42)
     sres = {"resolution": res, "circles": n, "threads": thread_list, "modes": {}}
     for mode in ("tiles", "simd"):
-        fn = make_fn(mode, tile=64)
+        fn = make_fn(mode, tile=TILE)
         row = []
         for t in thread_list:
             mean, *_ = time_render(fn, circ, res, t, warmup, iterations)
@@ -258,9 +259,9 @@ def run_all(warmup: int, iterations: int) -> dict:
             "modes": {"soa": [], "aos": []}}
     for r in res_list:
         circ_r = generate_dataset(resolution=r, n=n_fixed, seed=42)
-        fn_soa = make_fn("tiles", tile=64)
+        fn_soa = make_fn("tiles", tile=TILE)
         mean_soa, *_ = time_render(fn_soa, circ_r, r, MAX_THREADS, warmup, iterations)
-        fn_aos = functools.partial(render_parallel_tiles_aos, tile=64)
+        fn_aos = functools.partial(render_parallel_tiles_aos, tile=TILE)
         mean_aos, *_ = time_render(fn_aos, circ_r, r, MAX_THREADS, warmup, iterations)
         mres["modes"]["soa"].append(mean_soa)
         mres["modes"]["aos"].append(mean_aos)
@@ -271,7 +272,7 @@ def run_all(warmup: int, iterations: int) -> dict:
     print("[7/8] weak scaling ...")
     res = 1024
     base_n = 500
-    fn = make_fn("simd", tile=64)
+    fn = make_fn("simd", tile=TILE)
     base_circ = generate_dataset(resolution=res, n=base_n, seed=99)
     base_t, *_ = time_render(fn, base_circ, res, 1, warmup, iterations)
     wres = {"resolution": res, "base_circles": base_n, "base_ms": base_t,
