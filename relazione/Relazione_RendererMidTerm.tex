@@ -70,7 +70,9 @@
   block of real-time and offline rendering, and it is embarrassingly parallel in principle but
   easy to implement inefficiently. This report presents a CPU-only 2D circle rasterizer,
   implemented in Python with Numba, that draws $N$ alpha-blended circles onto an $H\times W$
-  image using the painter's algorithm. Four kernels of increasing sophistication are compared:
+  image using the painter's algorithm. Parallelism comes from plain Python threads
+  running on the free-threaded (GIL-free) build of Python 3.14.
+  Four kernels of increasing sophistication are compared:
   a sequential baseline, a naive per-pixel parallel kernel, a tile-based parallel kernel with
   bounding-box culling, and a tile-based kernel additionally written for auto-vectorization
   (branchless SIMD inner loop). On an 8-core Apple Silicon (M2) machine, the tiled, vectorized
@@ -200,7 +202,8 @@ that process several pixels per cycle.
 
 Four rendering kernels are implemented and compiled just-in-time with Numba, which
 generates native code through LLVM
-(\texttt{@njit}); they are referred to as \texttt{seq},
+(\texttt{@njit}); the three parallel ones run on a pool of Python threads
+on the free-threaded build of Python 3.14 (\S\ref{sec:nogil}). They are referred to as \texttt{seq},
 \texttt{pixels}, \texttt{tiles} and \texttt{simd}, and all four are required to
 produce the same image (up to floating-point reassociation error from
 \texttt{fastmath}).
@@ -215,8 +218,8 @@ produce the same image (up to floating-point reassociation error from
 \textbf{Mode} & \textbf{Parallelism} & \textbf{Notes} \\
 \midrule
 \texttt{seq}    & none              & baseline, bbox scan \\
-\texttt{pixels} & \texttt{prange} over rows   & no culling, slow \\
-\texttt{tiles}  & \texttt{prange} over tiles  & bbox culling per tile \\
+\texttt{pixels} & threads over rows   & no culling, slow \\
+\texttt{tiles}  & threads over tiles  & bbox culling per tile \\
 \texttt{simd}   & tiles + vector inner loop & fastest, branchless \\
 \bottomrule
 \end{tabular}
@@ -224,7 +227,7 @@ produce the same image (up to floating-point reassociation error from
 \label{tab:kernels}
 \end{table}
 
-\texttt{pixels} parallelizes Numba's \texttt{prange} over image rows: each
+\texttt{pixels} parallelizes over image rows: each
 thread owns a disjoint set of rows and, for every pixel, loops over \emph{all}
 $N$ circles with a cheap bounding-box rejection test. It has no spatial
 culling structure, so it is included mainly as a ``multithreading alone''
@@ -255,24 +258,62 @@ Removing the branch and keeping the accumulator arrays contiguous and small
 loads/stores, and lets \texttt{fastmath=True} fuse the distance computation
 into fused multiply-adds.
 
-\subsection{Load Balancing: prange and Scheduling}
+\subsection{Multithreading on Free-Threaded Python}
+\label{sec:nogil}
 
-Numba's \texttt{prange} is the direct analogue of an OpenMP
-\texttt{\#pragma omp parallel for}: it distributes loop iterations (rows, or
-tiles) across the threads set by \texttt{numba.set\_num\_threads()}. Because
-circle radii vary widely, the amount of work per tile is highly non-uniform
-(a tile with only small, sparse circles finishes almost instantly; a tile
-covered by several large overlapping circles is far more expensive). This is
-exactly the kind of irregular workload for which \emph{dynamic} scheduling is
-preferable to static partitioning. Unlike OpenMP, however, \texttt{prange}
-has no \texttt{schedule(static|dynamic|guided)} clause, so the three
-strategies cannot be compared directly. By default Numba splits the iteration
-space into roughly equal contiguous blocks, one per thread, which behaves like
-\texttt{schedule(static)}. The load is balanced instead by
-splitting the image into many small tiles (many more tiles than threads):
-each thread's block then contains many tiles, so cheap and expensive tiles
-average out. This is why the tile size is studied explicitly in
-Section~\ref{sec:results}.
+CPython's Global Interpreter Lock (GIL) allows only one thread at a time to
+execute Python code, so on a classic interpreter plain Python threads cannot
+speed up CPU-bound work: they take turns on a single core. PEP~703 introduced
+an optional \emph{free-threaded} build of CPython in which the GIL is
+removed; it is experimental in Python~3.13 and officially supported in
+Python~3.14 (\texttt{python3.14t})~\cite{slides}. On this build, threads
+created with the standard \texttt{threading} and
+\texttt{concurrent.futures} APIs run truly in parallel on different cores,
+as in C or Java. Numba supports the free-threaded build since version 0.65,
+so the compiled kernels can be called concurrently from several threads.
+
+The project runs on Python~3.14t, managed with \texttt{uv}, and the
+benchmark script refuses to start if the GIL is active. Running the same
+code on the same interpreter with the GIL re-enabled
+(\texttt{python -X gil=1}) is used as a control experiment
+(\S\ref{sec:gil}).
+
+The parallel versions are built on this mechanism. Each kernel
+receives two extra arguments, \texttt{start} and \texttt{step}, and processes
+only the work units (rows for \texttt{pixels}, tiles for \texttt{tiles} and
+\texttt{simd}) with index \texttt{start}, \texttt{start+step},
+\texttt{start+2*step}, \dots{} The Python wrapper submits one call per thread
+to a \texttt{concurrent.futures.ThreadPoolExecutor} with
+$p$ workers (thread $k$ gets \texttt{start}$=k$, \texttt{step}$=p$) and then
+waits for all of them, which acts as the final barrier:
+
+\begin{lstlisting}
+@njit(cache=True, fastmath=True)
+def kernel(img, ..., start, step):
+    for t in range(start, n_tiles, step):
+        ...                        # render tile t
+
+futures = [pool.submit(kernel, *args, k, p)
+           for k in range(p)]
+for f in futures:
+    f.result()                     # join
+\end{lstlisting}
+
+The pools are created once per thread count and reused, so thread creation
+is not part of the measured time. With $p=1$ the kernel is called directly
+on the main thread. The kernel code itself is the same as a sequential loop
+over the work units; only the loop bounds change.
+
+\paragraph{Work distribution.} Because circle radii vary widely, the amount
+of work per tile is highly non-uniform (a tile with only small, sparse
+circles finishes almost instantly; a tile covered by several large
+overlapping circles is far more expensive). Assigning each thread one
+contiguous block of tiles would give some threads all the expensive regions.
+The interleaved assignment above corresponds to OpenMP's
+\texttt{schedule(static,1)}: the tiles of every region of the image are
+spread across all threads, so cheap and expensive tiles average out. The
+load is further balanced by using many more tiles than threads, which is why
+the tile size is studied explicitly in Section~\ref{sec:results}.
 
 \subsection{Synchronization}
 
@@ -295,9 +336,10 @@ The default layout is SoA, as described above. For comparison, a
 
 Benchmarks were executed on an Apple Silicon MacBook Air \textbf{M2 (ARM64)}, a
 hybrid design with 4 performance and 4 efficiency cores (8 logical/physical
-cores reported by the OS). The software stack was Python 3.11.9, NumPy 2.4.6,
-Numba 0.67.0 and llvmlite 0.49.0 on macOS. Numba's thread ceiling
-(\texttt{NUMBA\_NUM\_THREADS}) was deliberately set to \textbf{16}, i.e.\
+cores reported by the OS). The software stack was the free-threaded build of
+Python 3.14.8 (GIL disabled), NumPy 2.5.3, Numba 0.68.0 and llvmlite 0.50.0
+on macOS, with the environment managed by \texttt{uv}. The maximum number of threads in
+the sweeps was deliberately set to \textbf{16}, i.e.\
 \emph{twice} the number of logical cores, so that the thread-scaling
 experiment can observe oversubscription behavior (thread count exceeding the
 physical core count) as required by the course guidelines~\cite{slides}, in addition to
@@ -579,7 +621,7 @@ limits on performance:
     no further gain beyond 8 threads, where the extra threads only
     oversubscribe the 8 physical cores and add scheduling overhead.
   \item \textbf{Load imbalance from circle-size variance}, which is exactly
-    why tile-based \texttt{prange} scheduling and tile-size tuning matter
+    why the interleaved tile distribution and tile-size tuning matter
     more than memory-layout choices for this workload: unlike a dense
     numerical kernel, the bottleneck here is uneven \emph{work} distribution
     across parallel units, not memory bandwidth or cache locality (as
@@ -590,8 +632,8 @@ limits on performance:
 \section{Conclusions}
 
 This project implemented and systematically benchmarked a CPU-parallel 2D
-circle rasterizer, combining coarse-grained multithreading (Numba
-\texttt{prange} over image tiles) with fine-grained SIMD vectorization
+circle rasterizer, combining coarse-grained multithreading (Python threads
+on free-threaded Python~3.14, over image tiles) with fine-grained SIMD vectorization
 (a branchless, auto-vectorizable inner loop). The tiled, vectorized kernel
 reaches a maximum speedup of \textbf{9.08$\times$} over the sequential
 baseline on an 8-core Apple Silicon M2, with vectorization alone contributing

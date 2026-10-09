@@ -10,9 +10,15 @@ quattro versioni per confrontare strategie di parallelizzazione e vettorizzazion
 | Versione | Parallelismo | Descrizione |
 |----------|--------------|-------------|
 | `seq`    | nessuno (1 thread) | per ogni cerchio visita solo il suo bounding box. È la baseline. |
-| `pixels` | `prange` sulle righe | ogni pixel controlla tutti i cerchi: nessuna selezione, quindi lento. |
-| `tiles`  | `prange` sulle tile | l'immagine è divisa in tile; ogni tile considera solo i cerchi che la toccano. |
-| `simd`   | `prange` sulle tile + SIMD | come `tiles`, con il ciclo interno senza salti, vettorizzato da LLVM. |
+| `pixels` | thread sulle righe | ogni pixel controlla tutti i cerchi: nessuna selezione, quindi lento. |
+| `tiles`  | thread sulle tile | l'immagine è divisa in tile; ogni tile considera solo i cerchi che la toccano. |
+| `simd`   | thread sulle tile + SIMD | come `tiles`, con il ciclo interno senza salti, vettorizzato da LLVM. |
+
+Il parallelismo usa normali thread Python (`ThreadPoolExecutor`) su **Python 3.14
+free-threaded** (`3.14t`), la versione dell'interprete senza GIL (PEP 703): i thread girano
+davvero in parallelo su core diversi. Il thread *k* di *p* elabora le righe/tile *k*, *k+p*,
+*k+2p*, … L'esperimento 8 riesegue lo stesso codice con il GIL riattivato (`-X gil=1`) per
+mostrare la differenza.
 
 Tutte le versioni producono la stessa immagine e non usano lock: ogni thread scrive su righe o
 tile diverse.
@@ -21,37 +27,44 @@ tile diverse.
 
 ```
 renderer_seq.py      dataset (Structure of Arrays) e le quattro versioni del renderer
-benchmark_plots.py   verifica di correttezza, 7 esperimenti e grafici
+benchmark_plots.py   verifica di correttezza, 8 esperimenti e grafici
+pyproject.toml       dipendenze del progetto (gestite con uv)
+.python-version      interprete richiesto: 3.14t (free-threaded)
 figures/             grafici prodotti dal benchmark + immagine di esempio
 relazione/           relazione tecnica (LaTeX e PDF)
 ```
 
 ## Requisiti
 
-Python 3.11 con:
+[uv](https://docs.astral.sh/uv/) e Python 3.14 free-threaded. `uv` installa l'interprete e
+crea l'ambiente `.venv` leggendo `.python-version` e `pyproject.toml` (versioni esatte in
+`uv.lock`):
+
+```bash
+uv python install 3.14+freethreaded
+uv sync
+```
 
 | Pacchetto  | Versione usata |
 |------------|----------------|
-| numpy      | 2.4.6  |
-| numba      | 0.67.0 |
-| llvmlite   | 0.49.0 |
-| matplotlib | 3.11.1 |
-
-```bash
-python3.11 -m venv .venv
-.venv/bin/pip install numpy numba matplotlib
-```
+| Python     | 3.14.8 free-threaded |
+| numpy      | 2.5.3  |
+| numba      | 0.68.0 (Python 3.14t supportato da 0.65) |
+| llvmlite   | 0.50.0 |
+| matplotlib | 3.11.2 |
 
 ## Esecuzione
 
 ```bash
-.venv/bin/python benchmark_plots.py
+uv run python benchmark_plots.py
 ```
+
+All'avvio il programma controlla l'interprete e si ferma se il GIL è attivo.
 
 `renderer_seq.py` è solo una libreria: non va lanciato, lo importa `benchmark_plots.py`.
 
 Il programma prima confronta l'output di ogni versione parallela con quello sequenziale e si
-ferma se differiscono oltre la tolleranza. Poi esegue i 7 esperimenti, stampa tutti i tempi
+ferma se differiscono oltre la tolleranza. Poi esegue gli 8 esperimenti, stampa tutti i tempi
 sul terminale e salva i grafici in `figures/`. La run completa dura circa 15–25 minuti.
 
 La relazione si compila dall'interno di `relazione/`, dove i grafici vengono letti da
@@ -75,6 +88,7 @@ pdflatex Relazione_RendererMidTerm.tex
 | 5 | Scalare vs SIMD | 1024², 4000 cerchi; 1–16 thread | `bench_simd.png` |
 | 6 | Layout di memoria SoA vs AoS | 512²–2048²; 3000 cerchi | `bench_memory_layout.png` |
 | 7 | Weak scaling | 1024²; 500 cerchi per thread | `bench_weak_scaling.png` |
+| 8 | GIL vs free-threading | `simd`, 1024², 4000 cerchi; stesso interprete con `-X gil=0` e `-X gil=1` | `bench_gil.png` |
 
 Nell'esperimento 1 `pixels` viene misurato su un dataset più piccolo (1024², 8000 cerchi) e
 solo da 4 thread in su, perché senza selezione dei cerchi sarebbe troppo lento.
@@ -85,7 +99,7 @@ solo da 4 thread in su, perché senza selezione dei cerchi sarebbe troppo lento.
 |-----------|--------|----------------|
 | Esecuzioni di riscaldamento (escluse dalla misura) | 2 | `WARMUP` in `benchmark_plots.py` |
 | Esecuzioni misurate per configurazione | 5 | `ITERATIONS` in `benchmark_plots.py` |
-| Numero massimo di thread | 2 × core logici (16 su Apple M2) | variabile d'ambiente `NUMBA_NUM_THREADS` |
+| Numero massimo di thread | 2 × core logici (16 su Apple M2) | `MAX_THREADS` in `benchmark_plots.py` |
 | Dimensione tile di default | 64 px | argomento `tile` delle funzioni di render |
 
 Per ogni configurazione vengono misurati tempo reale (media, minimo, massimo, deviazione
@@ -101,5 +115,5 @@ reale di cerchi con profondità e trasparenza da usare al suo posto.
 
 ## Ambiente di test
 
-MacBook Air Apple M2 (4 core performance + 4 core efficiency), macOS, Python 3.11.9.
+MacBook Air Apple M2 (4 core performance + 4 core efficiency), macOS, Python 3.14.8 free-threaded.
 I risultati completi e la loro analisi sono nella relazione in `relazione/`.
