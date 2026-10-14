@@ -17,6 +17,8 @@
 \usepackage{titlesec}
 \usepackage{fancyhdr}
 \usepackage{framed}
+% Segnaposto per i valori che dipendono dalla run sul server (da sostituire).
+\newcommand{\tbd}[1]{\textcolor{red}{\textbf{[#1]}}}
 
 \hypersetup{colorlinks=true,linkcolor=black,citecolor=black,urlcolor=blue}
 
@@ -67,53 +69,51 @@
 \begin{list}{}{\setlength{\leftmargin}{1.5em}\setlength{\rightmargin}{1.5em}}\item[]
 \small\itshape
   Rasterizing large numbers of alpha-blended, depth-ordered 2D primitives is a core building
-  block of real-time and offline rendering, and it is embarrassingly parallel in principle but
+  block of real-time and offline rendering, and it is easily parallel in principle but
   easy to implement inefficiently. This report presents a CPU-only 2D circle rasterizer,
   implemented in Python with Numba, that draws $N$ alpha-blended circles onto an $H\times W$
-  image using the painter's algorithm. Parallelism comes from plain Python threads
-  running on the free-threaded (GIL-free) build of Python 3.14.
-  Four kernels of increasing sophistication are compared:
+  image using the painter's algorithm. Parallelism comes from Python threads
+  running on the free-threaded (GIL-free) build.
+  Four kernels of increasing complexity are compared:
   a sequential baseline, a naive per-pixel parallel kernel, a tile-based parallel kernel with
   bounding-box culling, and a tile-based kernel additionally written for auto-vectorization
-  (branchless SIMD inner loop). On an 8-core Apple Silicon (M2) machine, the tiled, vectorized
-  kernel reaches a maximum speedup of \textbf{9.1$\times$} over the sequential baseline (on
-  16 oversubscribed threads), while a dedicated scalar-vs-SIMD comparison shows vectorization
-  alone contributes roughly \textbf{4$\times$} (3.6--5.5$\times$) at a fixed thread count. A broader set of
+  (branchless SIMD inner loop). On a 4-core / 8-thread AMD Ryzen~5 2400G, the tiled, vectorized
+  kernel reaches a maximum speedup of \tbd{S$_{\max}$} over the sequential baseline (on
+  \tbd{p} threads), while a dedicated scalar-vs-SIMD comparison shows vectorization
+  alone contributes roughly \tbd{X$\times$} at a fixed thread count. A broader set of
   micro-benchmarks additionally isolates the effect of resolution, circle count, tile size,
   memory layout (SoA vs.\ AoS) and weak scaling, providing a systematic picture of where the
   performance comes from and where it saturates.
   \end{list}
 
-\vspace{4pt}
-\noindent{\large\textbf{Future Distribution Permission}}\\
-The author(s) of this report give permission for this document to be distributed to
-Unifi-affiliated students taking future courses.
-
-
 %==================================================================
 \section{Introduction}
 
 This report presents the design, implementation and performance analysis of a
-sequential and parallelized 2D circle rasterizer. The project was developed for
-the \emph{Parallel Programming} course to demonstrate how coarse-grained
+sequential and parallelized 2D circle rasterizer. The project was developed to demonstrate how coarse-grained
 multithreading and fine-grained vectorization can be combined to accelerate a
-classic, embarrassingly-parallel computer-graphics workload.
+classic computer-graphics workload.
 
 \subsection{Problem Description and Motivation}
 
-Rasterization is the process of converting geometric primitives into pixels.
+Rasterization is the process of converting geometric elements into pixels.
 This project targets a deliberately simple but representative primitive set:
 $N$ circles, each defined by a 2D center, a depth coordinate $z$, a radius, an
-RGB color and an alpha (opacity) value. Circles are composited onto the image
+RGB color and an alpha value (opacity). Circles are composited onto the image
 using the \emph{painter's algorithm}: they are sorted by increasing depth and
 drawn back-to-front, blending each new circle onto the frame buffer with the
 standard ``over'' operator
 \[
   \text{out} = \text{src}_{\text{rgb}}\cdot a + \text{dst}_{\text{rgb}} \cdot (1-a).
 \]
+The name comes from the way a painter works: the background is painted
+first and nearer objects are painted over it, so whatever is closer covers
+whatever lies behind, without a depth buffer. With transparency the order
+is essential, because the ``over'' operator is not commutative: two
+overlapping circles blended in opposite orders give different colors.
 This is the same compositing model used by real rendering pipelines (e.g.\
 particle systems, 2D vector graphics, UI compositors), which makes the problem
-a realistic, minimal stand-in for a much larger class of rendering workloads.
+a realistic stand-in for a much larger class of rendering workloads.
 
 \subsection{Computational Challenges}
 
@@ -124,8 +124,7 @@ $O(H\cdot W\cdot N)$ work per frame. Even after restricting each circle to its
 axis-aligned bounding box, the workload remains large and highly
 \emph{irregular}: circles vary enormously in radius (a few pixels up to
 $\sim\!12\%$ of the image side), so the amount of work associated with
-different pixels — and with different spatial tiles of the image — is far
-from uniform. This irregularity, rather than raw arithmetic volume, is the
+different pixels is not uniform. This irregularity, rather than raw arithmetic volume, is the
 central challenge that the parallelization strategy has to address.
 
 \subsection{Objectives and Scope}
@@ -155,8 +154,7 @@ $(x, y, z, \text{radius}, r, g, b, a)$, rather than a list of per-circle
 objects. This layout is cache-friendly and is the natural starting point for
 vectorization, since each attribute is unit-stride in memory~\cite{robey}. Sorting by depth
 is done once, up front, with a \emph{stable} mergesort, so that circles with
-equal $z$ keep their original (insertion) order deterministically; the sort
-is never repeated inside a rendering kernel.
+equal $z$ keep their original order deterministically.
 
 \subsection{Sequential Algorithm}
 
@@ -175,8 +173,7 @@ for k in range(n):            # far -> near
 \end{lstlisting}
 
 This bounding-box restriction is the only optimization present in the
-sequential version; it is still $O(N)$ circles times, on average,
-$O(r_k^2)$ pixels, and it writes directly into a shared image buffer, which
+sequential version. It is still $O(N)$ circles times on average and it writes directly into a shared image buffer, which
 is safe here only because the loop is single-threaded.
 
 \subsection{Parallelization Strategy}
@@ -190,12 +187,31 @@ partitioned into disjoint regions — rows or square tiles — and each region
 processed independently by a different thread, with no shared mutable state
 and therefore no locks.
 
+The painter's algorithm also constrains how the work can be split: every
+pixel must receive its circles in depth order. Parallelizing over circles
+would let different threads blend onto the same pixel in an arbitrary
+order, requiring locks or a reordering step. Parallelizing over pixels
+keeps the order for free: each thread owns its pixels and walks the
+already sorted circle list, which is why sorting is done once, before the
+threads start.
+
 \paragraph{Vectorizing the inner loop (SIMD).} Inside a tile, testing a
 circle against many pixels performs the same arithmetic (subtraction,
 multiplication, comparison, blend) on independent data. If that inner loop is
 written without early-exit branches and with a small, contiguous, per-tile
 buffer, the compiler's auto-vectorizer can turn it into SIMD instructions
 that process several pixels per cycle.
+
+\paragraph{Flynn's taxonomy.} The two opportunities correspond to two
+classes of Flynn's taxonomy. Multithreading is \emph{MIMD} (Multiple
+Instruction, Multiple Data): each thread runs on its own core with its own
+instruction stream, on its own tiles, and may be culling one tile while
+another thread is blending pixels of a different one. Vectorization is
+\emph{SIMD} (Single Instruction, Multiple Data): a single instruction
+operates on several pixels at once, all following the same path. The four
+kernels therefore cover every combination: \texttt{seq} is SISD,
+\texttt{pixels} and \texttt{tiles} are MIMD only, and \texttt{simd} on
+several threads combines MIMD across cores with SIMD within each core.
 
 %==================================================================
 \section{Parallel Implementation}
@@ -334,20 +350,27 @@ The default layout is SoA, as described above. For comparison, a
 
 \subsection{Environment}
 
-Benchmarks were executed on an Apple Silicon MacBook Air \textbf{M2 (ARM64)}, a
-hybrid design with 4 performance and 4 efficiency cores (8 logical/physical
-cores reported by the OS). The software stack was the free-threaded build of
+Benchmarks were executed on a lab server with an \textbf{AMD Ryzen~5 2400G}
+(x86-64, first-generation Zen, 3.6\,GHz base clock): 4 identical physical cores
+with simultaneous multithreading (SMT, 2 hardware threads per core), i.e.\
+8 logical cores. Each core has a private 32\,KB L1 data cache, the size the
+default tile (32$\times$32 pixels, whose three per-tile R/G/B buffers take
+12\,KB) was tuned for. The CPU supports AVX2 and FMA, so the vectorized kernel
+operates on 256-bit vectors of 8 \texttt{float32}; note that Zen executes
+each 256-bit AVX2 instruction as two 128-bit halves. The machine runs Debian~13
+as a virtual machine on Proxmox. The software stack was the free-threaded build of
 Python 3.14.8 (GIL disabled), NumPy 2.5.3, Numba 0.68.0 and llvmlite 0.50.0
-on macOS, with the environment managed by \texttt{uv}. The maximum number of threads in
+on Linux, with the environment managed by \texttt{uv}. The maximum number of threads in
 the sweeps was deliberately set to \textbf{16}, i.e.\
 \emph{twice} the number of logical cores, so that the thread-scaling
 experiment can observe oversubscription behavior (thread count exceeding the
-physical core count) as required by the course guidelines~\cite{slides}, in addition to
-normal scaling up to the core count. The MacBook Air is fanless, so under
-sustained all-core load it reduces its clock frequency (thermal throttling):
-single-threaded timings were reproducible across runs, while multi-threaded
-timings varied by up to $\sim\!20\%$ between runs. Multi-threaded results
-should therefore be read as trends rather than exact values.
+logical core count) as required by the course guidelines~\cite{slides}, in addition to
+normal scaling up to the core count. Unlike a hybrid CPU, all cores run at
+the same speed, so the thread sweep has three clearly separated regimes:
+1--4 threads (one thread per physical core), 5--8 threads (two threads
+sharing the execution units of a physical core through SMT) and 9--16
+threads (oversubscription). The server is shared, so benchmarks were run
+while it was otherwise idle.
 
 \subsection{Dataset}
 
@@ -373,7 +396,7 @@ an external image dataset; there is no natural pre-existing dataset of
   \item \textbf{Iterations:} 5 timed iterations per configuration (subject to
     the time budget).
   \item \textbf{Scaling dataset:} the strong-scaling experiment (\S\ref{sec:scaling})
-    deliberately uses a large problem ($2048^2$ pixels, 100{,}000 circles) so
+    deliberately uses a large problem ($2048^2$ pixels, 60{,}000 circles) so
     that the sequential baseline takes $\ge 10\,$s, as required by the
     course's benchmarking guidelines~\cite{slides} for meaningful speedup measurements.
   \item \textbf{Validation:} before any timing, the benchmark script renders
@@ -385,7 +408,7 @@ an external image dataset; there is no natural pre-existing dataset of
     reassociation, and it stops the run if any kernel exceeds it. Two cases
     are tested: a $512^2$ image and a $1000\times700$ image, whose sides are
     not multiples of the tile size (partial tiles at the borders). The largest
-    difference measured was $1.2\cdot10^{-7}$, i.e.\ float32 rounding.
+    difference measured was \tbd{$\sim\!10^{-7}$}, i.e.\ float32 rounding.
 \end{itemize}
 
 %==================================================================
@@ -404,8 +427,8 @@ depth-sorted circles composited with the ``over'' operator.}
 \label{sec:scaling}
 
 Figure~\ref{fig:scaling} shows time, speedup and parallel efficiency versus
-thread count for a fixed, large problem ($2048^2$ pixels, 100{,}000 circles;
-sequential baseline: 13.55\,s). Table~\ref{tab:scaling} reports the same
+thread count for a fixed, large problem ($2048^2$ pixels, 60{,}000 circles;
+sequential baseline: \tbd{T$_{\text{seq}}$}\,s). Table~\ref{tab:scaling} reports the same
 data for the \texttt{simd} kernel.
 
 \begin{figure*}[t]
@@ -424,34 +447,32 @@ from 1 to 16 (oversubscribed) threads.}
 \toprule
 \textbf{Threads} & \textbf{Time (ms)} & \textbf{Speedup} & \textbf{Efficiency} \\
 \midrule
-1  & 5503.5 & 2.46$\times$ & 2.46 \\
-2  & 3022.8 & 4.48$\times$ & 2.24 \\
-4  & 2058.3 & 6.58$\times$ & 1.65 \\
-8  & 1582.2 & 8.56$\times$ & 1.07 \\
-16 & 1492.9 & 9.08$\times$ & 0.57 \\
+1  & \tbd{} & \tbd{} & \tbd{} \\
+2  & \tbd{} & \tbd{} & \tbd{} \\
+4  & \tbd{} & \tbd{} & \tbd{} \\
+8  & \tbd{} & \tbd{} & \tbd{} \\
+16 & \tbd{} & \tbd{} & \tbd{} \\
 \bottomrule
 \end{tabular}
-\caption{Strong scaling of the \texttt{simd} kernel on the 100{,}000-circle,
-$2048^2$ workload (speedup relative to the 13.55\,s sequential baseline;
+\caption{Strong scaling of the \texttt{simd} kernel on the 60{,}000-circle,
+$2048^2$ workload (speedup relative to the \tbd{T$_{\text{seq}}$}\,s sequential baseline;
 efficiency here is $\text{speedup}/p$).}
 \label{tab:scaling}
 \end{table}
 
+% DA RISCRIVERE con i risultati del server: verificare ogni affermazione
+% qualitativa di questo paragrafo sul nuovo grafico.
 Three effects are visible. First, vectorization alone already gives the
-\texttt{simd} kernel a large head start at $p{=}1$ (2.5$\times$ faster than
+\texttt{simd} kernel a large head start at $p{=}1$ (\tbd{X}$\times$ faster than
 \texttt{seq} on a single thread), confirming that SIMD and multithreading are
-largely independent, additive sources of speedup. Second, all three kernels
-scale well up to 4--8 threads, matching the machine's physical core count.
-Third, beyond 8 threads (i.e.\ once the thread count exceeds the number of
-physical cores, entering oversubscription on the efficiency cores) speedup
-flattens for every kernel while efficiency keeps dropping — the extra logical
-threads provide diminishing, then negligible, returns. The \texttt{tiles}
-kernel (culling, no SIMD) is consistently between \texttt{pixels} and
-\texttt{simd}, showing that culling and vectorization are complementary, not
-substitutable, optimizations: culling alone (\texttt{tiles}) only reaches
-$\sim\!0.7\times$ the sequential kernel's speedup at best, while adding SIMD
-on top pushes the maximum speedup to \textbf{9.08$\times$}. On this very
-dense workload (100{,}000 large circles) each tile has a long candidate list,
+largely independent, additive sources of speedup. Second, \tbd{scaling over
+1--4 threads, one thread per physical core}. Third, \tbd{gain from 5--8
+threads, where SMT siblings share a core's execution units, and behavior
+beyond 8 threads, under oversubscription}. The \texttt{tiles}
+kernel (culling, no SIMD) is \tbd{position relative to \texttt{pixels} and
+\texttt{simd}}: culling alone (\texttt{tiles}) reaches \tbd{X}$\times$ at best,
+while adding SIMD on top pushes the maximum speedup to \tbd{S$_{\max}$}. On this
+dense workload (60{,}000 large circles) each tile has a long candidate list,
 so \texttt{tiles} tests many circles per pixel, whereas \texttt{seq} only
 visits the pixels inside each circle's bounding box.
 
@@ -463,12 +484,14 @@ roughly linearly with problem size for all three kernels tested
 (\texttt{seq}, \texttt{tiles}, \texttt{simd}), consistent with the algorithm's
 cost being dominated by pixels-inside-bounding-boxes rather than by a
 resolution- or count-dependent constant overhead. \texttt{simd} is always
-the fastest, 2--5$\times$ faster than \texttt{tiles}, with the gap growing
+the fastest, \tbd{X--Y}$\times$ faster than \texttt{tiles}, with the gap growing
 with problem size. \texttt{tiles} beats \texttt{seq} in most configurations
-(at 2048$^2$, \texttt{tiles} is 2.3$\times$ faster than \texttt{seq};
-\texttt{simd} is 8.5$\times$ faster), but falls behind it at 8000 circles
-(235.8\,ms vs.\ 196.0\,ms): with many circles the per-tile candidate lists
+(at 2048$^2$, \texttt{tiles} is \tbd{X}$\times$ faster than \texttt{seq};
+\texttt{simd} is \tbd{X}$\times$ faster), but falls behind it at 8000 circles
+(\tbd{ms} vs.\ \tbd{ms}): with many circles the per-tile candidate lists
 grow long, the same effect seen in the strong-scaling experiment.
+% DA VERIFICARE: le affermazioni qualitative di questo paragrafo (sorpasso a
+% 8000 cerchi, gap crescente) vengono dalla run sull'M2.
 
 \begin{figure}[t]
 \centering
@@ -488,14 +511,15 @@ grow long, the same effect seen in the strong-scaling experiment.
 
 Figure~\ref{fig:tile} sweeps the tile side length from 16 to 256 pixels
 (1024$^2$ image, 4000 circles, 16 threads). \texttt{simd} is fastest at
-\textbf{tile~=~32} and \texttt{tiles} at tile~=~16 (with 32 only 10\% slower);
+\textbf{tile~=~32}, the value used as the default everywhere else, and
+\texttt{tiles} at tile~=~\tbd{N};
 both degrade quickly for larger tiles: bigger tiles mean fewer, coarser parallel work units (worse load
 balancing and less L1/L2 residency for the per-tile scratch buffers), while
 very small tiles pay a proportionally larger fixed per-tile overhead
-(building the candidate list). \texttt{simd} is consistently 3--4.3$\times$
-faster than \texttt{tiles} across the whole sweep, and both kernels prefer
-small tiles (16--32\,px), so the tile-size sweet spot depends little on
-whether the inner loop is vectorized.
+(building the candidate list). At tile~=~32 the three R/G/B scratch buffers
+of \texttt{simd} take 12\,KB and fit entirely in the 32\,KB L1 data cache;
+at tile~=~64 they take 48\,KB and no longer do. \texttt{simd} is consistently \tbd{X--Y}$\times$
+faster than \texttt{tiles} across the whole sweep. % DA VERIFICARE sul grafico
 
 \begin{figure}[t]
 \centering
@@ -511,11 +535,15 @@ To isolate the contribution of vectorization from thread count,
 Figure~\ref{fig:simd} compares \texttt{tiles} (scalar inner loop) against
 \texttt{simd} (vectorized inner loop) across the same thread sweep (1--16),
 at fixed resolution and circle count. At every thread count \texttt{simd} is
-faster: \textbf{3.6$\times$} at $p{=}1$ (327.4\,ms vs.\ 91.2\,ms) and still
-\textbf{4.0$\times$} at $p{=}16$ (91.1\,ms vs.\ 22.9\,ms). The peak of
-5.5$\times$ at $p{=}4$ is partly due to \texttt{tiles} scaling poorly from 2 to
-4 threads in this run (184.9\,ms $\to$ 144.1\,ms), rather than to
-\texttt{simd} itself. This confirms
+faster: \tbd{X}$\times$ at $p{=}1$ (\tbd{ms} vs.\ \tbd{ms}) and still
+\tbd{X}$\times$ at $p{=}16$ (\tbd{ms} vs.\ \tbd{ms}). A 256-bit AVX2
+vector holds 8 \texttt{float32} lanes, but first-generation Zen splits each
+256-bit operation into two 128-bit halves, so per cycle it processes about as
+many lanes as 128-bit SSE (4 \texttt{float32}). \tbd{comment on how the
+measured ratio compares with this}. In Flynn's terms, this experiment
+separates the two forms of parallelism: at $p{=}1$ \texttt{tiles} is SISD and
+\texttt{simd} is SIMD only; along the thread axis \texttt{tiles} is MIMD
+only, while \texttt{simd} combines MIMD and SIMD. This confirms
 that vectorization and multithreading are two genuinely separate levers on
 performance, and that neither substitutes for the other.
 
@@ -538,11 +566,11 @@ every candidate circle at every pixel), so it is the kernel most sensitive to
 how circles are laid out in memory. In \texttt{simd}, instead, each circle's
 attributes are loaded once per tile, before the vectorized loop, which then
 only touches the per-tile R/G/B buffers; since SIMD there works across pixels,
-not across circles, the circle layout would have almost no effect. Neither
-layout wins \textbf{consistently}: AoS is faster at 512$^2$ (24.5 vs.\
-28.9\,ms) and 2048$^2$ (188.5 vs.\ 209.6\,ms), SoA at 1024$^2$ (63.9 vs.\
-67.7\,ms). Differences of 6--15\% that change sign from one resolution to the
-next point to measurement variability rather than to a real layout effect.
+not across circles, the circle layout would have almost no effect.
+\tbd{SoA vs.\ AoS times at 512$^2$, 1024$^2$, 2048$^2$ and whether either
+layout wins consistently}.
+% Sull'M2 nessuno dei due vinceva in modo consistente (differenze 6-15% di
+% segno alterno): se il server conferma, la frase sotto resta valida.
 This is expected for this workload: circle attributes are read
 once per tile-candidate-test and once per pixel hit, not streamed
 sequentially over the whole array in a tight loop, so the unit-stride
@@ -561,16 +589,14 @@ matters far less here than it would for a bulk, streaming numerical kernel.
 
 Figure~\ref{fig:weak} keeps work-per-thread constant by growing the circle
 count proportionally to the thread count (500 circles per thread). Efficiency
-is $\ge\!1.0$ up to 4 threads (i.e.\ within the physical core count, where
-larger batches amortize fixed per-call overhead better than the 1-thread
-case), then drops to 0.65 at 8 threads and 0.34 at 16. The two drops have
-different causes. At 8 threads there is no oversubscription yet (8 threads on
-8 cores), but threads 5--8 run on the slower efficiency cores, so the
-threads on the performance cores finish early and wait for them. At 16
-threads the machine is oversubscribed (16 threads on 8 cores): the extra
-threads add no compute and efficiency halves again. Both effects match the
-strong scaling result, so they are properties of the machine rather than of
-a specific fixed problem size.
+is \tbd{values at 1, 2, 4, 8, 16 threads}.
+% DA RISCRIVERE con i risultati. Chiave di lettura per il Ryzen:
+% 1-4 thread = un thread per core fisico (efficienza attesa vicina a 1);
+% 5-8 = SMT, due thread condividono le unità di esecuzione di un core
+% (guadagno parziale, efficienza in calo); 9-16 = oversubscription
+% (nessun calcolo in più, l'efficienza dovrebbe circa dimezzarsi).
+\tbd{interpretation of the 1--4, 5--8 (SMT) and 9--16 (oversubscription)
+regimes, and whether it matches strong scaling}.
 
 \begin{figure}[t]
 \centering
@@ -580,33 +606,65 @@ a specific fixed problem size.
 \label{fig:weak}
 \end{figure}
 
+\subsection{GIL vs.\ Free-Threading}
+\label{sec:gil}
+
+To verify that the measured speedup really comes from the absence of the
+GIL, the \texttt{simd} kernel ($1024^2$ image, 4000 circles) is timed over
+the same thread sweep (1--16) in two subprocesses launched with the
+\emph{same} free-threaded interpreter: one with \texttt{-X gil=0}
+(free-threading, the configuration used everywhere else) and one with
+\texttt{-X gil=1} (GIL re-enabled at startup). Code, data, interpreter and
+machine are identical; only the GIL changes. The benchmark script also
+checks, inside each subprocess, that the GIL is actually in the requested
+state.
+
+The kernels are compiled without Numba's \texttt{nogil=True}, so with the
+GIL enabled a thread holds the lock for the whole duration of its kernel
+call and the other threads wait: they run one at a time, and no speedup is
+expected. Figure~\ref{fig:gil} confirms this: \tbd{speedup with the GIL
+stays at about X$\times$ for every thread count, while without the GIL it
+reaches Y$\times$ at p threads}.
+% DA VERIFICARE: se con il GIL lo speedup scende sotto 1 con molti thread,
+% citarlo (costo del passaggio del GIL tra i thread).
+This shows that the parallelism measured in this report is due to the
+free-threaded build of CPython, not to the compiled code releasing the GIL
+on its own.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{../figures/bench_gil.png}
+\caption{Speedup of the \texttt{simd} kernel vs.\ thread count on the same
+Python~3.14t interpreter, with the GIL disabled (\texttt{-X gil=0}) and
+re-enabled (\texttt{-X gil=1}); $1024^2$ image, 4000 circles.}
+\label{fig:gil}
+\end{figure}
+
 \subsection{Comparison with Amdahl's and Gustafson's Laws}
 
 Amdahl's law~\cite{amdahl} bounds the speedup on $p$ threads as
 $S(p)=1/\bigl(f+(1-f)/p\bigr)$, where $f$ is the fraction of the run that
 cannot be parallelized. In the \texttt{simd} wrapper the only serial work is
-allocating the image and sorting the circles by $Z$: about 17\,ms out of the
-5.5\,s single-thread run on the strong scaling workload, so $f\approx0.003$.
-With this $f$, Amdahl predicts $S(8)\approx7.8$ and $S(16)\approx15.3$
+allocating the image and sorting the circles by $Z$: about \tbd{ms} out of the
+\tbd{s} single-thread run on the strong scaling workload, so $f\approx$\tbd{f}.
+With this $f$, Amdahl predicts $S(8)\approx$\tbd{} and $S(16)\approx$\tbd{}
 relative to \texttt{simd} on one thread. The measured values
-(Table~\ref{tab:scaling}) are much lower: $5503.5/1582.2=3.5$ at 8 threads
-and $3.7$ at 16. The Karp--Flatt metric
+(Table~\ref{tab:scaling}) are \tbd{values at 8 and 16 threads}. The Karp--Flatt metric
 $e=\bigl(1/S(p)-1/p\bigr)/\bigl(1-1/p\bigr)$,
 which
 estimates the serial fraction from the measured speedup, gives
-$e=0.10$, $0.17$, $0.19$ and $0.22$ for $p=2,4,8,16$. It is far above
-0.003 and grows with $p$. A growing $e$ indicates that the limit is not
-serial code but an overhead that increases with the thread count: the
-slower efficiency cores from 5 threads on, thermal throttling under
-all-core load, and oversubscription at 16 threads.
+$e=$\tbd{} for $p=2,4,8,16$.
+% DA RISCRIVERE: se e cresce con p, il limite non è il codice seriale ma un
+% overhead che aumenta con i thread. Sul Ryzen le cause candidate sono:
+% SMT da 5 thread in poi (due thread per core condividono le unità di
+% esecuzione) e oversubscription oltre 8. Niente core eterogenei, niente
+% thermal throttling (era specifico del MacBook Air).
+\tbd{interpretation of $e$: SMT from 5 threads on, oversubscription beyond 8}.
 
 Gustafson's law~\cite{robey} describes the weak scaling case, where the
 problem grows with $p$: the scaled speedup is $S(p)=p-f\,(p-1)$, so with
-$f\approx0.003$ the efficiency should stay close to 1. This matches the
-measurements up to 4 threads (efficiency $\ge1.0$,
-Fig.~\ref{fig:weak}) but not beyond (0.65 at 8, 0.34 at 16), confirming the
-same conclusion: past the performance cores, scaling is limited by the
-hardware, not by the serial part of the algorithm.
+$f\approx$\tbd{f} the efficiency should stay close to 1. \tbd{comparison with
+the measured weak scaling efficiency (Fig.~\ref{fig:weak})}.
 
 \subsection{Bottleneck Analysis}
 
@@ -614,12 +672,12 @@ Taken together, the experiments point to two dominant, largely independent
 limits on performance:
 
 \begin{itemize}[itemsep=1pt,topsep=2pt]
-  \item \textbf{Heterogeneous cores and oversubscription.} Every
-    scaling experiment (strong and weak) shows the same qualitative
-    behavior: good scaling up to 4 threads (the performance cores), smaller
-    gains from 5 to 8 threads, when the slower efficiency cores join in, and
-    no further gain beyond 8 threads, where the extra threads only
-    oversubscribe the 8 physical cores and add scheduling overhead.
+  \item \textbf{Physical core count, SMT and oversubscription.}
+    \tbd{what strong and weak scaling show in the three regimes: 1--4 threads
+    (one per physical core), 5--8 threads (SMT siblings competing for the
+    same execution units, which a compute-bound vectorized kernel already
+    keeps busy) and beyond 8 threads (oversubscription of the 8 logical
+    cores, scheduling overhead only)}.
   \item \textbf{Load imbalance from circle-size variance}, which is exactly
     why the interleaved tile distribution and tile-size tuning matter
     more than memory-layout choices for this workload: unlike a dense
@@ -635,18 +693,17 @@ This project implemented and systematically benchmarked a CPU-parallel 2D
 circle rasterizer, combining coarse-grained multithreading (Python threads
 on free-threaded Python~3.14, over image tiles) with fine-grained SIMD vectorization
 (a branchless, auto-vectorizable inner loop). The tiled, vectorized kernel
-reaches a maximum speedup of \textbf{9.08$\times$} over the sequential
-baseline on an 8-core Apple Silicon M2, with vectorization alone contributing
-roughly \textbf{4$\times$} independently of thread count. Culling
+reaches a maximum speedup of \tbd{S$_{\max}$} over the sequential
+baseline on a 4-core / 8-thread AMD Ryzen~5 2400G, with vectorization alone contributing
+roughly \tbd{X$\times$} independently of thread count. Culling
 (tile-based candidate lists) and vectorization proved to be complementary,
 additive optimizations rather than substitutes for one another. A dedicated
 tile-size sweep identified small tiles (32~px for \texttt{simd}) as the sweet spot for this workload,
 and, since tiles are disjoint, the renderer needs no synchronization at all.
 Memory layout (SoA vs.\ AoS) had a comparatively minor effect,
 consistent with a workload whose bottleneck is irregular per-tile work rather
-than memory bandwidth. Both strong and weak scaling confirm that scaling is
-good on the 4 performance cores, weaker once the efficiency cores are
-involved, and flat under oversubscription beyond 8 threads.
+than memory bandwidth. \tbd{one-sentence summary of strong and weak scaling
+across the physical-core, SMT and oversubscription regimes}.
 
 Future work could explore spatial acceleration structures (e.g.\ a
 tile-local BVH or grid over circles for very high circle counts), GPU

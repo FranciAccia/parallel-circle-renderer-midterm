@@ -11,7 +11,8 @@ parti diverse dell'immagine. Con il GIL attivo gli stessi thread verrebbero
 eseguiti uno alla volta (vedi esperimento 8 in benchmark_plots.py).
 
 Regole di rendering (uguali per tutti i kernel):
-  * i cerchi si disegnano per Z crescente: quelli con Z maggiore stanno sopra;
+  * painter's algorithm: i cerchi si disegnano per Z crescente, quelli con Z
+    maggiore stanno sopra. L'ordine conta perche' "over" non e' commutativo;
   * un pixel e' dentro un cerchio se il suo centro (i+0.5, j+0.5) rispetta
     dx^2 + dy^2 <= r^2;
   * alpha blending "over": out = src * a + dst * (1 - a).
