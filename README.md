@@ -17,8 +17,9 @@ quattro versioni per confrontare strategie di parallelizzazione e vettorizzazion
 Il parallelismo usa normali thread Python (`ThreadPoolExecutor`) su **Python 3.14
 free-threaded** (`3.14t`), la versione dell'interprete senza GIL (PEP 703): i thread girano
 davvero in parallelo su core diversi. Il thread *k* di *p* elabora le righe/tile *k*, *k+p*,
-*k+2p*, … L'esperimento 8 riesegue lo stesso codice con il GIL riattivato (`-X gil=1`) per
-mostrare la differenza.
+*k+2p*, … (come `schedule(static,1)` di OpenMP; l'esperimento 6 confronta anche `static`,
+`static,c` e `dynamic,c`). L'esperimento 10 riesegue lo stesso codice con il GIL riattivato
+(`-X gil=1`) per mostrare la differenza.
 
 Tutte le versioni producono la stessa immagine e non usano lock: ogni thread scrive su righe o
 tile diverse.
@@ -27,7 +28,7 @@ tile diverse.
 
 ```
 renderer_seq.py      dataset (Structure of Arrays) e le quattro versioni del renderer
-benchmark_plots.py   verifica di correttezza, 8 esperimenti e grafici
+benchmark_plots.py   verifica di correttezza, 10 esperimenti e grafici
 pyproject.toml       dipendenze del progetto (gestite con uv)
 .python-version      interprete richiesto: 3.14t (free-threaded)
 figures/             grafici prodotti dal benchmark + immagine di esempio
@@ -64,7 +65,7 @@ All'avvio il programma controlla l'interprete e si ferma se il GIL è attivo.
 `renderer_seq.py` è solo una libreria: non va lanciato, lo importa `benchmark_plots.py`.
 
 Il programma prima confronta l'output di ogni versione parallela con quello sequenziale e si
-ferma se differiscono oltre la tolleranza. Poi esegue gli 8 esperimenti, stampa tutti i tempi
+ferma se differiscono oltre la tolleranza. Poi esegue i 10 esperimenti, stampa tutti i tempi
 sul terminale e salva i grafici in `figures/`. La run completa dura circa 15–25 minuti.
 
 La relazione si compila dall'interno di `relazione/`, dove i grafici vengono letti da
@@ -80,18 +81,21 @@ pdflatex Relazione_RendererMidTerm.tex
 
 | # | Esperimento | Parametri | Grafico |
 |---|-------------|-----------|---------|
-| 0 | Verifica di correttezza | 512², 1000×700; 2000 cerchi; tolleranza 1e-3 | — |
+| 0 | Verifica di correttezza | 512², 1000×700; 2000 cerchi; tolleranza 1e-3; anche `simd` con altri scheduling | — |
 | 1 | Strong scaling | 2048², 60.000 cerchi; 1–16 thread | `bench_scaling.png` |
-| 2 | Tempo vs risoluzione | 512², 1024², 2048²; 3000 cerchi | `bench_resolution.png` |
-| 3 | Tempo vs numero di cerchi | 1024²; 500–8000 cerchi | `bench_circles.png` |
-| 4 | Tempo vs dimensione tile | 1024², 4000 cerchi; tile 16–256 px | `bench_tile.png` |
-| 5 | Scalare vs SIMD | 1024², 4000 cerchi; 1–16 thread | `bench_simd.png` |
-| 6 | Layout di memoria SoA vs AoS | 512²–2048²; 3000 cerchi | `bench_memory_layout.png` |
-| 7 | Weak scaling | 1024²; 500 cerchi per thread | `bench_weak_scaling.png` |
-| 8 | GIL vs free-threading | `simd`, 1024², 4000 cerchi; stesso interprete con `-X gil=0` e `-X gil=1` | `bench_gil.png` |
+| 2 | Speedup per dimensione dell'input | `simd`, 512², 1024², 2048²; 3000 cerchi; 1–16 thread | `bench_speedup_sizes.png` |
+| 3 | Tempo vs risoluzione | 512², 1024², 2048²; 3000 cerchi | `bench_resolution.png` |
+| 4 | Tempo vs numero di cerchi | 1024²; 500–8000 cerchi | `bench_circles.png` |
+| 5 | Tempo vs dimensione tile | 1024², 4000 cerchi; tile 16–256 px | `bench_tile.png` |
+| 6 | Strategie di scheduling | `simd`, 1024², 4000 cerchi uniformi e concentrati al centro; `static`, `static,1/4/16`, `dynamic,1/4/16`; 8 e 16 thread | `bench_scheduling.png` |
+| 7 | Scalare vs SIMD | 1024², 4000 cerchi; 1–16 thread | `bench_simd.png` |
+| 8 | Layout di memoria SoA vs AoS | 512²–2048²; 3000 cerchi | `bench_memory_layout.png` |
+| 9 | Weak scaling | 1024²; 500 cerchi per thread | `bench_weak_scaling.png` |
+| 10 | GIL vs free-threading | `simd`, 1024², 4000 cerchi; stesso interprete con `-X gil=0` e `-X gil=1` | `bench_gil.png` |
 
 Nell'esperimento 1 `pixels` viene misurato su un dataset più piccolo (1024², 8000 cerchi) e
-solo da 4 thread in su, perché senza selezione dei cerchi sarebbe troppo lento.
+solo da 4 thread in su, perché senza selezione dei cerchi sarebbe troppo lento; il suo
+speedup è calcolato rispetto a un sequenziale misurato sullo stesso dataset ridotto.
 
 ## Parametri di misura
 
@@ -101,9 +105,10 @@ solo da 4 thread in su, perché senza selezione dei cerchi sarebbe troppo lento.
 | Esecuzioni misurate per configurazione | 5 | `ITERATIONS` in `benchmark_plots.py` |
 | Numero massimo di thread | 2 × core logici (16 sul Ryzen 5 2400G) | `MAX_THREADS` in `benchmark_plots.py` |
 | Dimensione tile di default | 32 px | costante `TILE` in `renderer_seq.py` |
+| Scheduling di default | `static,1` (a salti) | parametro `schedule` di `render_parallel_tiles` / `render_tiles_simd` |
 
-Per ogni configurazione vengono misurati tempo reale (media, minimo, massimo, deviazione
-standard, intervallo di confidenza al 95%) e tempo CPU.
+Per ogni configurazione vengono misurati e stampati tempo reale (media, minimo, massimo,
+deviazione standard campionaria, intervallo di confidenza al 95%) e tempo CPU.
 
 ## Dataset
 

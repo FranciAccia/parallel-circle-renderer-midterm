@@ -17,6 +17,7 @@ import matplotlib.ticker as mticker
 
 from renderer_seq import (
     RENDERERS, TILE, generate_dataset, render, render_parallel_tiles_aos,
+    render_tiles_simd,
 )
 
 
@@ -25,6 +26,7 @@ from renderer_seq import (
 MAX_THREADS = 2 * (os.process_cpu_count() or 1)
 WARMUP = 2       # esecuzioni di riscaldamento, escluse dalla misura
 ITERATIONS = 5   # esecuzioni misurate per ogni configurazione
+N_EXP = 10       # numero di esperimenti in run_all()
 
 
 def time_render(render_fn, circles, resolution, threads, warmup, iterations,
@@ -32,8 +34,9 @@ def time_render(render_fn, circles, resolution, threads, warmup, iterations,
     """Misura tempo reale e tempo CPU di render_fn.
 
     Si ferma prima se le misure superano `budget_s` secondi.
-    Ritorna (media, min, max, std, media_cpu, ci95) in ms, dove ci95 e'
-    l'intervallo di confidenza al 95%: 1.96 * std / sqrt(n).
+    Ritorna (media, min, max, std, media_cpu, ci95) in ms, dove std e' la
+    deviazione standard campionaria e ci95 l'intervallo di confidenza al 95%:
+    1.96 * std / sqrt(n).
     """
     render_fn = functools.partial(render_fn, num_threads=threads)
 
@@ -57,8 +60,9 @@ def time_render(render_fn, circles, resolution, threads, warmup, iterations,
     ms = np.asarray(ts) * 1e3
     cpu_ms = np.asarray(cpu_ts) * 1e3
     n = len(ms)
-    ci95 = 1.96 * ms.std(ddof=1) / np.sqrt(n) if n > 1 else 0.0
-    return (float(ms.mean()), float(ms.min()), float(ms.max()), float(ms.std()),
+    std = float(ms.std(ddof=1)) if n > 1 else 0.0
+    ci95 = 1.96 * std / np.sqrt(n) if n > 1 else 0.0
+    return (float(ms.mean()), float(ms.min()), float(ms.max()), std,
             float(cpu_ms.mean()), float(ci95))
 
 
@@ -84,7 +88,7 @@ def check_interpreter() -> None:
 
 
 def gil_worker(gil: int, threads: list[int], warmup: int, iterations: int) -> None:
-    """Eseguito in un sottoprocesso (esperimento 8), con il GIL attivo o no.
+    """Eseguito in un sottoprocesso (esperimento 10), con il GIL attivo o no.
 
     Misura `simd` per ogni numero di thread e stampa i tempi come JSON
     sull'ultima riga, letta dal processo principale.
@@ -92,8 +96,9 @@ def gil_worker(gil: int, threads: list[int], warmup: int, iterations: int) -> No
     res, n = 1024, 4000
     circ = generate_dataset(resolution=res, n=n, seed=42)
     fn = make_fn("simd", tile=TILE)
-    times = [time_render(fn, circ, res, t, warmup, iterations)[0] for t in threads]
-    print(json.dumps({"gil": gil, "gil_enabled": gil_enabled(), "times_ms": times}))
+    stats = [time_render(fn, circ, res, t, warmup, iterations) for t in threads]
+    print(json.dumps({"gil": gil, "gil_enabled": gil_enabled(),
+                      "times_ms": [st[0] for st in stats], "stats": stats}))
 
 
 def make_fn(mode, tile):
@@ -108,20 +113,30 @@ def check_correctness(tol: float = 1e-3) -> None:
 
     Si usa una tolleranza e non l'uguaglianza esatta: con fastmath=True i
     risultati possono differire negli ultimi bit. Oltre all'immagine quadrata
-    si prova un'immagine rettangolare con lati non multipli della tile.
+    si prova un'immagine rettangolare con lati non multipli della tile, e
+    `simd` viene provato anche con le altre strategie di scheduling.
     """
-    print("[0/8] verifica correttezza ...")
+    print(f"[0/{N_EXP}] verifica correttezza ...")
     for res in (512, (1000, 700)):
         circ = generate_dataset(resolution=res, n=2000, seed=7)
         ref = render(circ, res)
         fns = {mode: make_fn(mode, tile=TILE) for mode in ("pixels", "tiles", "simd")}
         fns["tiles_aos"] = functools.partial(render_parallel_tiles_aos, tile=TILE)
+        for sch in ("static", "static,4", "dynamic,4"):
+            fns[f"simd {sch}"] = functools.partial(render_tiles_simd, tile=TILE, schedule=sch)
         for name, fn in fns.items():
             err = float(np.abs(fn(circ, res, num_threads=MAX_THREADS) - ref).max())
             label = res if isinstance(res, int) else f"{res[0]}x{res[1]}"
-            print(f"    {name:9s} {label} -> errore max {err:.1e}")
+            print(f"    {name:14s} {label} -> errore max {err:.1e}")
             if err > tol:
                 raise SystemExit(f"ERRORE: '{name}' diverso dal sequenziale ({err:.1e} > {tol})")
+
+
+def _fmt(st) -> str:
+    """Una riga con le statistiche ritornate da time_render."""
+    mean, mn, mx, std, cpu, ci = st
+    return (f"{mean:9.1f} ms  (std {std:.1f}, min {mn:.1f}, max {mx:.1f}, "
+            f"CI95 +/-{ci:.1f}, cpu {cpu:.0f} ms)")
 
 
 def run_all(warmup: int, iterations: int) -> dict:
@@ -132,6 +147,8 @@ def run_all(warmup: int, iterations: int) -> dict:
     resolutions = [512, 1024, 2048]
     circle_counts = [500, 1000, 2000, 4000, 8000]
     tile_sizes = [16, 32, 64, 128, 256]
+    schedules = ["static", "static,1", "static,4", "static,16",
+                 "dynamic,1", "dynamic,4", "dynamic,16"]
 
     results: dict = {
         "meta": {
@@ -141,52 +158,75 @@ def run_all(warmup: int, iterations: int) -> dict:
         }
     }
 
-    # --- 1. scaling vs thread ----------------------------------------------
+    # --- 1. strong scaling vs thread ---------------------------------------
     # Dataset grande (60.000 cerchi) perché il sequenziale duri almeno 10 s
     # (circa 13.5 s sul Ryzen 5 2400G).
-    print("[1/8] scaling vs thread ...")
+    print(f"[1/{N_EXP}] strong scaling vs thread ...")
     # Se il tempo sequenziale stampato scende sotto 10 s, aumentare n e n_max.
     res, n, n_max = 2048, 60_000, 60_000
     circ = generate_dataset(resolution=res, n=n, n_max=n_max, seed=42)
-    base_ms, _, _, _, base_cpu_ms, base_ci = time_render(
-        render, circ, res, 1, warmup, iterations, budget_s=90.0
-    )
-    print(f"    seq (baseline) -> {base_ms / 1000:8.2f} s  (CI95 +/-{base_ci:.1f} ms, "
-          f"cpu {base_cpu_ms / 1000:.2f} s)")
-    scaling = {"resolution": res, "circles": n, "seq_ms": base_ms,
-               "seq_cpu_ms": base_cpu_ms, "seq_ci95_ms": base_ci,
-               "threads": thread_list, "modes": {}, "ci95_ms": {}}
+    st = time_render(render, circ, res, 1, warmup, iterations, budget_s=90.0)
+    print(f"    seq (baseline)  -> {_fmt(st)}")
+    scaling = {"resolution": res, "circles": n, "seq_ms": st[0], "seq_stats": st,
+               "threads": thread_list, "modes": {}, "ci95_ms": {}, "stats": {}}
 
     # 'pixels' non ha culling (selezione) e sul dataset grande sarebbe troppo lento:
-    # lo misuriamo su un dataset piu' piccolo (1024x1024, 8000 cerchi).
-    circ_pixels = generate_dataset(resolution=1024, n=8000, seed=42)
-    res_pixels = 1024
+    # lo misuriamo su un dataset piu' piccolo (1024x1024, 8000 cerchi), con un
+    # suo sequenziale di riferimento per calcolarne lo speedup.
+    res_pixels, n_pixels = 1024, 8000
+    circ_pixels = generate_dataset(resolution=res_pixels, n=n_pixels, seed=42)
+    st = time_render(render, circ_pixels, res_pixels, 1, warmup, iterations)
+    print(f"    seq (baseline pixels, {res_pixels}^2, {n_pixels} cerchi) -> {_fmt(st)}")
+    scaling["pixels_resolution"] = res_pixels
+    scaling["pixels_circles"] = n_pixels
+    scaling["pixels_seq_ms"] = st[0]
 
     for mode in ("pixels", "tiles", "simd"):
         fn = make_fn(mode, tile=TILE)
         m_threads = [t for t in thread_list if t >= 4] if mode == "pixels" else thread_list
-        row, ci_row = [], []
+        row, ci_row, st_row = [], [], []
         for t in thread_list:
             if t not in m_threads:
                 row.append(None)
                 ci_row.append(None)
+                st_row.append(None)
                 continue
             # Qui basta 1 warm-up: ogni esecuzione dura secondi.
             if mode == "pixels":
-                mean, _, _, _, _, ci = time_render(
-                    fn, circ_pixels, res_pixels, t, 1, iterations, budget_s=15.0)
+                st = time_render(fn, circ_pixels, res_pixels, t, 1, iterations, budget_s=15.0)
             else:
-                mean, _, _, _, _, ci = time_render(
-                    fn, circ, res, t, 1, iterations, budget_s=70.0)
-            row.append(mean)
-            ci_row.append(ci)
-            print(f"    {mode:7s} t={t:<2d} -> {mean:8.1f} ms")
+                st = time_render(fn, circ, res, t, 1, iterations, budget_s=70.0)
+            row.append(st[0])
+            ci_row.append(st[5])
+            st_row.append(st)
+            print(f"    {mode:7s} t={t:<2d} -> {_fmt(st)}")
         scaling["modes"][mode] = row
         scaling["ci95_ms"][mode] = ci_row
+        scaling["stats"][mode] = st_row
     results["scaling"] = scaling
 
-    # --- 2. tempo vs risoluzione: 3000 cerchi, max thread ----------------
-    print("[2/8] tempo vs risoluzione ...")
+    # --- 2. speedup vs thread per piu' dimensioni dell'input --------------
+    print(f"[2/{N_EXP}] speedup vs thread per dimensione dell'immagine ...")
+    n = 3000
+    fn = make_fn("simd", tile=TILE)
+    sz = {"circles": n, "threads": thread_list, "resolutions": resolutions,
+          "seq_ms": [], "times_ms": []}
+    for r in resolutions:
+        circ_r = generate_dataset(resolution=r, n=n, seed=42)
+        st = time_render(render, circ_r, r, 1, warmup, iterations)
+        seq_ms = st[0]
+        print(f"    seq  {r}^2       -> {_fmt(st)}")
+        row = []
+        for t in thread_list:
+            st = time_render(fn, circ_r, r, t, warmup, iterations)
+            row.append(st[0])
+            print(f"    simd {r}^2 t={t:<2d} -> {_fmt(st)}  speedup {seq_ms / st[0]:.2f}x")
+        sz["seq_ms"].append(seq_ms)
+        sz["times_ms"].append(row)
+    results["speedup_sizes"] = sz
+
+    # --- 3. tempo vs risoluzione: 3000 cerchi, max thread ----------------
+    print(f"[3/{N_EXP}] tempo vs risoluzione ...")
     n = 3000
     rres = {"circles": n, "threads": MAX_THREADS, "resolutions": resolutions, "modes": {}}
     for mode in ("seq", "tiles", "simd"):
@@ -195,14 +235,14 @@ def run_all(warmup: int, iterations: int) -> dict:
         for r in resolutions:
             circ_r = generate_dataset(resolution=r, n=n, seed=42)
             t = 1 if mode == "seq" else MAX_THREADS
-            mean, *_ = time_render(fn, circ_r, r, t, warmup, iterations)
-            row.append(mean)
-            print(f"    {mode:7s} {r}^2 -> {mean:8.1f} ms")
+            st = time_render(fn, circ_r, r, t, warmup, iterations)
+            row.append(st[0])
+            print(f"    {mode:7s} {r}^2 -> {_fmt(st)}")
         rres["modes"][mode] = row
     results["resolution"] = rres
 
-    # --- 3. tempo vs numero di cerchi: 1024x1024, max thread ------------
-    print("[3/8] tempo vs numero cerchi ...")
+    # --- 4. tempo vs numero di cerchi: 1024x1024, max thread ------------
+    print(f"[4/{N_EXP}] tempo vs numero cerchi ...")
     res = 1024
     cres = {"resolution": res, "threads": MAX_THREADS,
             "counts": circle_counts, "modes": {}}
@@ -212,14 +252,14 @@ def run_all(warmup: int, iterations: int) -> dict:
         for n in circle_counts:
             circ_n = generate_dataset(resolution=res, n=n, seed=42)
             t = 1 if mode == "seq" else MAX_THREADS
-            mean, *_ = time_render(fn, circ_n, res, t, warmup, iterations)
-            row.append(mean)
-            print(f"    {mode:7s} n={n:<5d} -> {mean:8.1f} ms")
+            st = time_render(fn, circ_n, res, t, warmup, iterations)
+            row.append(st[0])
+            print(f"    {mode:7s} n={n:<5d} -> {_fmt(st)}")
         cres["modes"][mode] = row
     results["circles"] = cres
 
-    # --- 4. tempo vs dimensione tile: 1024x1024, 4000 cerchi -----------
-    print("[4/8] tempo vs dimensione tile ...")
+    # --- 5. tempo vs dimensione tile: 1024x1024, 4000 cerchi -----------
+    print(f"[5/{N_EXP}] tempo vs dimensione tile ...")
     res, n = 1024, 4000
     circ = generate_dataset(resolution=res, n=n, seed=42)
     tres = {"resolution": res, "circles": n, "threads": MAX_THREADS,
@@ -228,14 +268,36 @@ def run_all(warmup: int, iterations: int) -> dict:
         row = []
         for ts_ in tile_sizes:
             fn = make_fn(mode, tile=ts_)
-            mean, *_ = time_render(fn, circ, res, MAX_THREADS, warmup, iterations)
-            row.append(mean)
-            print(f"    {mode:7s} tile={ts_:<3d} -> {mean:8.1f} ms")
+            st = time_render(fn, circ, res, MAX_THREADS, warmup, iterations)
+            row.append(st[0])
+            print(f"    {mode:7s} tile={ts_:<3d} -> {_fmt(st)}")
         tres["modes"][mode] = row
     results["tile"] = tres
 
-    # --- 5. effetto SIMD: tiles vs simd a vari thread -----------------
-    print("[5/8] effetto SIMD ...")
+    # --- 6. strategie di scheduling: simd, 1024x1024, 4000 cerchi --------
+    # Due dataset: cerchi uniformi (carico per tile quasi uniforme) e cerchi
+    # concentrati al centro (carico molto sbilanciato tra le tile).
+    print(f"[6/{N_EXP}] strategie di scheduling ...")
+    res, n = 1024, 4000
+    sched_threads = sorted({os.process_cpu_count() or 1, MAX_THREADS})
+    schres = {"resolution": res, "circles": n, "schedules": schedules,
+              "threads": sched_threads, "datasets": {}}
+    for dist in ("uniform", "gaussian"):
+        circ = generate_dataset(resolution=res, n=n, seed=42, distribution=dist)
+        per_t = []
+        for t in sched_threads:
+            row = []
+            for sch in schedules:
+                fn = functools.partial(render_tiles_simd, tile=TILE, schedule=sch)
+                st = time_render(fn, circ, res, t, warmup, iterations)
+                row.append(st[0])
+                print(f"    {dist:8s} t={t:<2d} {sch:10s} -> {_fmt(st)}")
+            per_t.append(row)
+        schres["datasets"][dist] = per_t
+    results["scheduling"] = schres
+
+    # --- 7. effetto SIMD: tiles vs simd a vari thread -----------------
+    print(f"[7/{N_EXP}] effetto SIMD ...")
     res, n = 1024, 4000
     circ = generate_dataset(resolution=res, n=n, seed=42)
     sres = {"resolution": res, "circles": n, "threads": thread_list, "modes": {}}
@@ -243,16 +305,16 @@ def run_all(warmup: int, iterations: int) -> dict:
         fn = make_fn(mode, tile=TILE)
         row = []
         for t in thread_list:
-            mean, *_ = time_render(fn, circ, res, t, warmup, iterations)
-            row.append(mean)
-            print(f"    {mode:7s} t={t:<2d} -> {mean:8.1f} ms")
+            st = time_render(fn, circ, res, t, warmup, iterations)
+            row.append(st[0])
+            print(f"    {mode:7s} t={t:<2d} -> {_fmt(st)}")
         sres["modes"][mode] = row
     for t, a, b in zip(thread_list, sres["modes"]["tiles"], sres["modes"]["simd"]):
         print(f"    speedup SIMD t={t:<2d} -> {a / b:5.2f}x")
     results["simd"] = sres
 
-    # --- 6. memory layout: SoA vs AoS -----------------------------------
-    print("[6/8] memory layout: SoA vs AoS ...")
+    # --- 8. memory layout: SoA vs AoS -----------------------------------
+    print(f"[8/{N_EXP}] memory layout: SoA vs AoS ...")
     res_list = [512, 1024, 2048]
     n_fixed = 3000
     mres = {"circles": n_fixed, "threads": MAX_THREADS, "resolutions": res_list,
@@ -260,38 +322,39 @@ def run_all(warmup: int, iterations: int) -> dict:
     for r in res_list:
         circ_r = generate_dataset(resolution=r, n=n_fixed, seed=42)
         fn_soa = make_fn("tiles", tile=TILE)
-        mean_soa, *_ = time_render(fn_soa, circ_r, r, MAX_THREADS, warmup, iterations)
+        st_soa = time_render(fn_soa, circ_r, r, MAX_THREADS, warmup, iterations)
         fn_aos = functools.partial(render_parallel_tiles_aos, tile=TILE)
-        mean_aos, *_ = time_render(fn_aos, circ_r, r, MAX_THREADS, warmup, iterations)
-        mres["modes"]["soa"].append(mean_soa)
-        mres["modes"]["aos"].append(mean_aos)
-        print(f"    {r}^2  SoA={mean_soa:7.1f} ms  AoS={mean_aos:7.1f} ms")
+        st_aos = time_render(fn_aos, circ_r, r, MAX_THREADS, warmup, iterations)
+        mres["modes"]["soa"].append(st_soa[0])
+        mres["modes"]["aos"].append(st_aos[0])
+        print(f"    {r}^2  SoA -> {_fmt(st_soa)}")
+        print(f"    {r}^2  AoS -> {_fmt(st_aos)}")
     results["memory_layout"] = mres
 
-    # --- 7. weak scaling: lavoro per thread costante ---------------------
-    print("[7/8] weak scaling ...")
+    # --- 9. weak scaling: lavoro per thread costante ---------------------
+    print(f"[9/{N_EXP}] weak scaling ...")
     res = 1024
     base_n = 500
     fn = make_fn("simd", tile=TILE)
     base_circ = generate_dataset(resolution=res, n=base_n, seed=99)
-    base_t, *_ = time_render(fn, base_circ, res, 1, warmup, iterations)
+    base_t = time_render(fn, base_circ, res, 1, warmup, iterations)[0]
     wres = {"resolution": res, "base_circles": base_n, "base_ms": base_t,
             "threads": thread_list, "times_ms": [], "efficiency": []}
     for t in thread_list:
         n_t = min(base_n * t, 10_000)
         circ_t = generate_dataset(resolution=res, n=n_t, seed=99)
-        mean, *_ = time_render(fn, circ_t, res, t, warmup, iterations)
-        eff = base_t / mean if mean > 0 else 0.0
-        wres["times_ms"].append(mean)
+        st = time_render(fn, circ_t, res, t, warmup, iterations)
+        eff = base_t / st[0] if st[0] > 0 else 0.0
+        wres["times_ms"].append(st[0])
         wres["efficiency"].append(eff)
-        print(f"    t={t:<2d} n={n_t:<6d} -> {mean:8.1f} ms  (eff={eff:.2f})")
+        print(f"    t={t:<2d} n={n_t:<6d} -> {_fmt(st)}  (eff={eff:.2f})")
     results["weak_scaling"] = wres
 
-    # --- 8. GIL vs free-threading ----------------------------------------
+    # --- 10. GIL vs free-threading ---------------------------------------
     # Stesso codice e stesso interprete, lanciato due volte in un
     # sottoprocesso: con -X gil=0 (free-threading) e con -X gil=1 (GIL
     # riattivato). Cambia solo la presenza del GIL.
-    print("[8/8] GIL vs free-threading ...")
+    print(f"[10/{N_EXP}] GIL vs free-threading ...")
     here = os.path.dirname(os.path.abspath(__file__))
     gres = {"resolution": 1024, "circles": 4000, "threads": thread_list, "modes": {}}
     for gil in (0, 1):
@@ -304,8 +367,8 @@ def run_all(warmup: int, iterations: int) -> dict:
             raise SystemExit(f"ERRORE: con -X gil={gil} il GIL attivo e' {data['gil_enabled']}")
         key = "gil" if gil else "free_threaded"
         gres["modes"][key] = data["times_ms"]
-        for t, ms in zip(thread_list, data["times_ms"]):
-            print(f"    {'GIL attivo' if gil else 'senza GIL'} t={t:<2d} -> {ms:8.1f} ms")
+        for t, st in zip(thread_list, data["stats"]):
+            print(f"    {'GIL attivo' if gil else 'senza GIL'} t={t:<2d} -> {_fmt(st)}")
     results["gil"] = gres
 
     return results
@@ -337,31 +400,42 @@ def plot_scaling(d, path):
     seq_ms = s["seq_ms"]
     ci_by_mode = s.get("ci95_ms", {})
 
+    # 'pixels' e' misurato su un dataset diverso e solo da 4 thread in su:
+    # ha un suo sequenziale di riferimento e lo si dice in legenda.
+    pix_data = f"{s['pixels_resolution']}², {s['pixels_circles']} cerchi"
+    labels = {mode: MODE_STYLE[mode]["label"] for mode in s["modes"]}
+    labels["pixels"] = f"pixels ({pix_data})"
+    seq_ref = {mode: seq_ms for mode in s["modes"]}
+    seq_ref["pixels"] = s["pixels_seq_ms"]
+
     fig, ax = plt.subplots(1, 3, figsize=(16, 4.6))
 
     # (a) tempo assoluto
     ax[0].axhline(seq_ms, color=MODE_STYLE["seq"]["color"], ls="--",
                   label=f"seq 1 thread ({seq_ms:.0f} ms)")
+    ax[0].axhline(s["pixels_seq_ms"], color=MODE_STYLE["seq"]["color"], ls=":",
+                  label=f"seq 1 thread, {pix_data} ({s['pixels_seq_ms']:.0f} ms)")
     for mode, row in s["modes"].items():
         x, y = _clean(threads, row)
         ax[0].plot(x, y, **{k: MODE_STYLE[mode][k] for k in ("color", "marker")},
-                   label=MODE_STYLE[mode]["label"])
+                   label=labels[mode])
     ax[0].set(xlabel="thread", ylabel="tempo [ms]",
               title=f"Tempo di rendering  ({s['resolution']}², {s['circles']} cerchi)")
     ax[0].set_yscale("log")
     ax[0].grid(True, alpha=.3)
-    ax[0].legend()
+    ax[0].legend(fontsize=8, framealpha=.9)
 
     # (b) speedup rispetto al sequenziale, con barre di errore CI95%
     for mode, row in s["modes"].items():
         x, y = _clean(threads, row)
         ci_row = ci_by_mode.get(mode, [None] * len(row))
         _, ci = _clean(threads, ci_row)
-        speedup = [seq_ms / v for v in y]
-        yerr = [(seq_ms / v) * (c / v) if c else 0.0 for v, c in zip(y, ci)]
+        ref = seq_ref[mode]
+        speedup = [ref / v for v in y]
+        yerr = [(ref / v) * (c / v) if c else 0.0 for v, c in zip(y, ci)]
         ax[1].errorbar(x, speedup, yerr=yerr, capsize=3,
                         **{k: MODE_STYLE[mode][k] for k in ("color", "marker")},
-                        label=MODE_STYLE[mode]["label"])
+                        label=labels[mode])
     ax[1].plot(threads, threads, "k:", alpha=.5, label="ideale (lineare)")
     ax[1].set(xlabel="thread", ylabel="speedup  (T_seq / T)",
               title="Speedup rispetto al sequenziale  (barre: CI 95%)")
@@ -374,16 +448,64 @@ def plot_scaling(d, path):
         if not y:
             continue
         t0, base = x[0], y[0]
+        label = MODE_STYLE[mode]["label"]
+        if t0 != 1:
+            label += f" (baseline {t0} thread)"
         ax[2].plot(x, [(base / v) / (t / t0) for v, t in zip(y, x)],
                    **{k: MODE_STYLE[mode][k] for k in ("color", "marker")},
-                   label=MODE_STYLE[mode]["label"])
+                   label=label)
     ax[2].axhline(1.0, color="k", ls=":", alpha=.5, label="ideale")
     ax[2].set(xlabel="thread",
-              ylabel="efficienza  (T(1) / T(p)) / p",
-              title="Efficienza parallela  (baseline: kernel a 1 thread)",
+              ylabel="efficienza  (T(t0) / T(p)) / (p / t0)",
+              title="Efficienza parallela  (rispetto al kernel stesso)",
               ylim=(0, None))
     ax[2].grid(True, alpha=.3)
     ax[2].legend()
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+
+
+def plot_speedup_sizes(d, path):
+    z = d["speedup_sizes"]
+    threads = z["threads"]
+    styles = [dict(color="#7fc8d1", marker="o"), dict(color="#00798c", marker="D"),
+              dict(color="#003d47", marker="s")]
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for r, seq_ms, row, sty in zip(z["resolutions"], z["seq_ms"], z["times_ms"], styles):
+        ax.plot(threads, [seq_ms / v for v in row], **sty,
+                label=f"{r}×{r}  (seq {seq_ms:.0f} ms)")
+    ax.plot(threads, threads, "k:", alpha=.5, label="ideale (lineare)")
+    ax.set(xlabel="thread", ylabel="speedup  (T_seq / T)",
+           title=f"Speedup di simd per dimensione dell'immagine  ({z['circles']} cerchi)")
+    ax.grid(True, alpha=.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+
+
+def plot_scheduling(d, path):
+    s = d["scheduling"]
+    schedules = s["schedules"]
+    threads = s["threads"]
+    titles = {"uniform": "cerchi uniformi", "gaussian": "cerchi concentrati al centro"}
+    colors = ["#7fc8d1", "#00798c"]
+    x = np.arange(len(schedules))
+    w = 0.8 / len(threads)
+
+    fig, ax = plt.subplots(1, 2, figsize=(13, 4.8))
+    for a, (dist, per_t) in zip(ax, s["datasets"].items()):
+        for i, (t, row) in enumerate(zip(threads, per_t)):
+            a.bar(x + (i - (len(threads) - 1) / 2) * w, row, w,
+                  color=colors[i % len(colors)], label=f"{t} thread")
+        a.set(xticks=x, ylabel="tempo [ms]",
+              title=f"simd, {titles[dist]}  ({s['resolution']}², {s['circles']} cerchi)")
+        a.set_xticklabels(schedules, rotation=30, ha="right")
+        a.grid(True, axis="y", alpha=.3)
+        a.legend()
 
     fig.tight_layout()
     fig.savefig(path, dpi=120)
@@ -576,9 +698,11 @@ def main():
     # I grafici vanno in figures/, la cartella usata dalla relazione.
     os.makedirs("figures", exist_ok=True)
     plot_scaling(results, "figures/bench_scaling.png")
+    plot_speedup_sizes(results, "figures/bench_speedup_sizes.png")
     plot_resolution(results, "figures/bench_resolution.png")
     plot_circles(results, "figures/bench_circles.png")
     plot_tile(results, "figures/bench_tile.png")
+    plot_scheduling(results, "figures/bench_scheduling.png")
     plot_simd(results, "figures/bench_simd.png")
     plot_aos_vs_soa(results, "figures/bench_memory_layout.png")
     plot_weak_scaling(results, "figures/bench_weak_scaling.png")

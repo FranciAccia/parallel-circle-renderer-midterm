@@ -8,7 +8,7 @@ Parallelismo: il codice gira su Python 3.14 free-threaded (3.14t), che non ha
 il GIL. Il lavoro (righe o tile) viene diviso tra piu' thread Python di un
 ThreadPoolExecutor, che eseguono lo stesso kernel Numba in contemporanea su
 parti diverse dell'immagine. Con il GIL attivo gli stessi thread verrebbero
-eseguiti uno alla volta (vedi esperimento 8 in benchmark_plots.py).
+eseguiti uno alla volta (vedi esperimento 10 in benchmark_plots.py).
 
 Regole di rendering (uguali per tutti i kernel):
   * painter's algorithm: i cerchi si disegnano per Z crescente, quelli con Z
@@ -99,11 +99,25 @@ def _n_tiles(w: int, h: int, tile: int) -> int:
 _POOLS: dict[int, ThreadPoolExecutor] = {}
 
 
-def _run_parallel(kernel, args, n_items: int, num_threads: int | None) -> None:
-    """Esegue `kernel(*args, start, step)` su `num_threads` thread Python.
+def _static_chunks(kernel, args, k: int, nt: int, chunk: int, n_items: int) -> None:
+    """Blocchi di `chunk` elementi assegnati a turno: il thread k elabora i
+    blocchi k, k+nt, k+2nt, ... (come schedule(static, chunk) di OpenMP)."""
+    for s in range(k * chunk, n_items, nt * chunk):
+        kernel(*args, s, min(s + chunk, n_items), 1)
 
-    Il thread k elabora gli elementi k, k+nt, k+2nt, ... (righe o tile):
-    la distribuzione a salti bilancia il carico tra le zone dell'immagine.
+
+def _run_parallel(kernel, args, n_items: int, num_threads: int | None,
+                  schedule: str = "static,1") -> None:
+    """Esegue `kernel(*args, start, stop, step)` su `num_threads` thread Python.
+
+    `schedule` sceglie come dividere gli elementi (righe o tile) tra i thread,
+    con gli stessi nomi di OpenMP:
+      "static"    : un blocco contiguo per thread;
+      "static,c"  : blocchi di c elementi assegnati a turno (default c=1: il
+                    thread k elabora k, k+nt, k+2nt, ..., che bilancia il
+                    carico tra le zone dell'immagine);
+      "dynamic,c" : blocchi di c elementi messi in coda; ogni thread libero
+                    prende il blocco successivo.
     Su Python free-threaded i thread girano davvero in parallelo, su core
     diversi; con il GIL attivo verrebbero serializzati. I pool vengono
     riusati tra una chiamata e l'altra, cosi' il costo di creazione dei
@@ -114,12 +128,29 @@ def _run_parallel(kernel, args, n_items: int, num_threads: int | None) -> None:
         num_threads = os.process_cpu_count() or 1
     nt = max(1, min(int(num_threads), n_items))
     if nt == 1:
-        kernel(*args, 0, 1)
+        kernel(*args, 0, n_items, 1)
         return
     pool = _POOLS.get(nt)
     if pool is None:
         pool = _POOLS[nt] = ThreadPoolExecutor(max_workers=nt)
-    futures = [pool.submit(kernel, *args, k, nt) for k in range(nt)]
+
+    kind, _, c = schedule.partition(",")
+    chunk = int(c) if c else 0
+    if kind == "static" and chunk == 0:
+        size = (n_items + nt - 1) // nt
+        futures = [pool.submit(kernel, *args, k * size, min((k + 1) * size, n_items), 1)
+                   for k in range(nt)]
+    elif kind == "static" and chunk == 1:
+        futures = [pool.submit(kernel, *args, k, n_items, nt) for k in range(nt)]
+    elif kind == "static":
+        futures = [pool.submit(_static_chunks, kernel, args, k, nt, chunk, n_items)
+                   for k in range(nt)]
+    elif kind == "dynamic":
+        chunk = max(1, chunk)
+        futures = [pool.submit(kernel, *args, s, min(s + chunk, n_items), 1)
+                   for s in range(0, n_items, chunk)]
+    else:
+        raise ValueError(f"schedule sconosciuto: {schedule!r}")
     for f in futures:
         f.result()  # attende la fine e rilancia eventuali eccezioni
 
@@ -133,11 +164,16 @@ def generate_dataset(
     n_min: int = 100,
     n_max: int = 10_000,
     seed: int | None = None,
+    distribution: str = "uniform",
 ) -> CircleSoA:
     """Genera cerchi casuali per un'immagine di data risoluzione.
 
     n: numero di cerchi, limitato a [n_min, n_max]; se None e' casuale.
     seed: seme per rendere il dataset riproducibile.
+    distribution: "uniform" (centri uniformi sull'immagine) o "gaussian"
+      (centri concentrati al centro dell'immagine, deviazione standard 1/8
+      del lato): il lavoro per tile diventa molto sbilanciato. Usato solo
+      dall'esperimento sullo scheduling in benchmark_plots.py.
     """
     rng = np.random.default_rng(seed)
     w, h = _as_wh(resolution)
@@ -147,8 +183,14 @@ def generate_dataset(
     else:
         n = int(min(max(n, n_min), n_max))
 
-    x = rng.uniform(0.0, w, size=n)
-    y = rng.uniform(0.0, h, size=n)
+    if distribution == "uniform":
+        x = rng.uniform(0.0, w, size=n)
+        y = rng.uniform(0.0, h, size=n)
+    elif distribution == "gaussian":
+        x = np.clip(rng.normal(w / 2, w / 8, size=n), 0.0, w)
+        y = np.clip(rng.normal(h / 2, h / 8, size=n), 0.0, h)
+    else:
+        raise ValueError(f"distribuzione sconosciuta: {distribution!r}")
     z = rng.uniform(0.0, 1.0, size=n)
 
     # Raggio da 3 px fino al 12% del lato dell'immagine.
@@ -251,9 +293,10 @@ def render(
 # ---------------------------------------------------------------------------
 @njit(cache=True, fastmath=True)
 def _render_kernel_parallel_pixels(
-    img, x, y, z, radius, cr, cg, cb, ca, bg0, bg1, bg2, start, step
+    img, x, y, z, radius, cr, cg, cb, ca, bg0, bg1, bg2, start, stop, step
 ):
     """Parallelo sulle righe dell'immagine: disegna le righe start, start+step, ...
+    fino a stop (escluso).
 
     Ogni thread scrive righe diverse, quindi non servono lock. Per ogni pixel
     si controllano TUTTI i cerchi (nessun culling): per questo e' lento.
@@ -262,7 +305,7 @@ def _render_kernel_parallel_pixels(
     w = img.shape[1]
     n = x.shape[0]
 
-    for j in range(start, h, step):     # righe di questo thread
+    for j in range(start, stop, step):  # righe di questo thread
         py = j + 0.5
         for i in range(w):
             px = i + 0.5
@@ -317,10 +360,10 @@ def render_parallel_pixels(
 # ---------------------------------------------------------------------------
 @njit(cache=True, fastmath=True)
 def _render_kernel_parallel_tiles(
-    img, x, y, z, radius, cr, cg, cb, ca, bg0, bg1, bg2, tile, start, step
+    img, x, y, z, radius, cr, cg, cb, ca, bg0, bg1, bg2, tile, start, stop, step
 ):
     """Parallelo su blocchi quadrati (tile) di lato `tile`: disegna i tile
-    start, start+step, ...
+    start, start+step, ... fino a stop (escluso).
 
     Ogni thread lavora su tile diversi, quindi non servono lock. Per ogni tile:
       1. si selezionano i cerchi che toccano il tile (culling);
@@ -331,10 +374,8 @@ def _render_kernel_parallel_tiles(
     n = x.shape[0]
 
     n_tx = (w + tile - 1) // tile
-    n_ty = (h + tile - 1) // tile
-    n_tiles = n_tx * n_ty
 
-    for t in range(start, n_tiles, step):  # tile di questo thread
+    for t in range(start, stop, step):  # tile di questo thread
         tx = t % n_tx
         ty = t // n_tx
 
@@ -392,10 +433,11 @@ def render_parallel_tiles(
     background=(1.0, 1.0, 1.0),
     tile: int = TILE,
     num_threads: int | None = None,
+    schedule: str = "static,1",
 ) -> np.ndarray:
     """Come `render`, con il kernel a tile.
     tile: lato del tile in pixel; num_threads: thread da usare
-    (None = numero di core logici)."""
+    (None = numero di core logici); schedule: vedi `_run_parallel`."""
     tile = max(1, int(tile))
     w, h = _as_wh(resolution)
     img = np.empty((h, w, 3), dtype=np.float32)
@@ -406,7 +448,8 @@ def render_parallel_tiles(
         np.float32(background[0]), np.float32(background[1]), np.float32(background[2]),
         np.int64(tile),
     )
-    _run_parallel(_render_kernel_parallel_tiles, args, _n_tiles(w, h, tile), num_threads)
+    _run_parallel(_render_kernel_parallel_tiles, args, _n_tiles(w, h, tile), num_threads,
+                  schedule)
     return img
 
 
@@ -423,20 +466,18 @@ def render_parallel_tiles(
 #   * fastmath=True permette al compilatore di usare FMA e riordinare i calcoli.
 @njit(cache=True, fastmath=True)
 def _render_kernel_tiles_simd(
-    img, x, y, z, radius, cr, cg, cb, ca, bg0, bg1, bg2, tile, start, step
+    img, x, y, z, radius, cr, cg, cb, ca, bg0, bg1, bg2, tile, start, stop, step
 ):
     h = img.shape[0]
     w = img.shape[1]
     n = x.shape[0]
 
     n_tx = (w + tile - 1) // tile
-    n_ty = (h + tile - 1) // tile
-    n_tiles = n_tx * n_ty
     cap = tile * tile
 
     one = np.float32(1.0)
 
-    for t in range(start, n_tiles, step):
+    for t in range(start, stop, step):
         tx = t % n_tx
         ty = t // n_tx
         x0 = tx * tile
@@ -512,6 +553,7 @@ def render_tiles_simd(
     background=(1.0, 1.0, 1.0),
     tile: int = TILE,
     num_threads: int | None = None,
+    schedule: str = "static,1",
 ) -> np.ndarray:
     """Come `render_parallel_tiles`, con il kernel vettorizzato (SIMD)."""
     tile = max(1, int(tile))
@@ -524,7 +566,8 @@ def render_tiles_simd(
         np.float32(background[0]), np.float32(background[1]), np.float32(background[2]),
         np.int64(tile),
     )
-    _run_parallel(_render_kernel_tiles_simd, args, _n_tiles(w, h, tile), num_threads)
+    _run_parallel(_render_kernel_tiles_simd, args, _n_tiles(w, h, tile), num_threads,
+                  schedule)
     return img
 
 
@@ -537,16 +580,14 @@ _AOS_X, _AOS_Y, _AOS_Z, _AOS_R, _AOS_CR, _AOS_CG, _AOS_CB, _AOS_CA = range(8)
 
 
 @njit(cache=True, fastmath=True)
-def _render_kernel_tiles_aos(img, flat, bg0, bg1, bg2, tile, start, step):
+def _render_kernel_tiles_aos(img, flat, bg0, bg1, bg2, tile, start, stop, step):
     h = img.shape[0]
     w = img.shape[1]
     n = flat.shape[0]
 
     n_tx = (w + tile - 1) // tile
-    n_ty = (h + tile - 1) // tile
-    n_tiles = n_tx * n_ty
 
-    for t in range(start, n_tiles, step):
+    for t in range(start, stop, step):
         tx = t % n_tx
         ty = t // n_tx
 

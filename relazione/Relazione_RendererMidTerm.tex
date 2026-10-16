@@ -12,11 +12,8 @@
 \usepackage{hyperref}
 \usepackage{xcolor}
 \usepackage{caption}
-\usepackage{subcaption}
 \usepackage{listings}
 \usepackage{titlesec}
-\usepackage{fancyhdr}
-\usepackage{framed}
 % Segnaposto per i valori che dipendono dalla run sul server (da sostituire).
 \newcommand{\tbd}[1]{\textcolor{red}{\textbf{[#1]}}}
 
@@ -46,9 +43,6 @@
 }
 
 %==================== TITOLO / ABSTRACT (stile CVPR: full-width prima delle due colonne) ====================
-\newcommand{\reporttitle}{Parallel Programming for Computer Graphics\\[2pt]
-\large Mid-term project: \textit{2D Circle Rasterization}}
-
 \begin{document}
 
 \twocolumn[
@@ -82,7 +76,7 @@
   \tbd{p} threads), while a dedicated scalar-vs-SIMD comparison shows vectorization
   alone contributes roughly \tbd{X$\times$} at a fixed thread count. A broader set of
   micro-benchmarks additionally isolates the effect of resolution, circle count, tile size,
-  memory layout (SoA vs.\ AoS) and weak scaling, providing a systematic picture of where the
+  scheduling strategy, memory layout (SoA vs.\ AoS) and weak scaling, providing a systematic picture of where the
   performance comes from and where it saturates.
   \end{list}
 
@@ -140,7 +134,7 @@ The scope includes:
     inner loop is written to be auto-vectorized by the compiler.
   \item \textbf{Systematic micro-benchmarking:} isolating, one variable at a
     time, the effect of thread count, image resolution, circle count, tile
-    size, SIMD, memory layout and weak scaling.
+    size, scheduling strategy, SIMD, memory layout and weak scaling.
 \end{enumerate}
 
 %==================================================================
@@ -173,8 +167,10 @@ for k in range(n):            # far -> near
 \end{lstlisting}
 
 This bounding-box restriction is the only optimization present in the
-sequential version. It is still $O(N)$ circles times on average and it writes directly into a shared image buffer, which
-is safe here only because the loop is single-threaded.
+sequential version. The cost is therefore proportional to the total
+bounding-box area of the $N$ circles rather than to $H\cdot W\cdot N$, and
+the kernel writes directly into a shared image buffer, which is safe here
+only because the loop is single-threaded.
 
 \subsection{Parallelization Strategy}
 
@@ -295,21 +291,22 @@ code on the same interpreter with the GIL re-enabled
 (\S\ref{sec:gil}).
 
 The parallel versions are built on this mechanism. Each kernel
-receives two extra arguments, \texttt{start} and \texttt{step}, and processes
-only the work units (rows for \texttt{pixels}, tiles for \texttt{tiles} and
-\texttt{simd}) with index \texttt{start}, \texttt{start+step},
-\texttt{start+2*step}, \dots{} The Python wrapper submits one call per thread
-to a \texttt{concurrent.futures.ThreadPoolExecutor} with
-$p$ workers (thread $k$ gets \texttt{start}$=k$, \texttt{step}$=p$) and then
-waits for all of them, which acts as the final barrier:
+receives three extra arguments, \texttt{start}, \texttt{stop} and
+\texttt{step}, and processes only the work units (rows for \texttt{pixels},
+tiles for \texttt{tiles} and \texttt{simd}) with index \texttt{start},
+\texttt{start+step}, \dots{} up to \texttt{stop}. The Python wrapper
+submits the calls to a \texttt{concurrent.futures.ThreadPoolExecutor} with
+$p$ workers and then waits for all of them, which acts as the final barrier.
+With the default distribution, thread $k$ gets \texttt{start}$=k$,
+\texttt{step}$=p$:
 
 \begin{lstlisting}
 @njit(cache=True, fastmath=True)
-def kernel(img, ..., start, step):
-    for t in range(start, n_tiles, step):
+def kernel(img, ..., start, stop, step):
+    for t in range(start, stop, step):
         ...                        # render tile t
 
-futures = [pool.submit(kernel, *args, k, p)
+futures = [pool.submit(kernel, *args, k, n_tiles, p)
            for k in range(p)]
 for f in futures:
     f.result()                     # join
@@ -331,12 +328,65 @@ spread across all threads, so cheap and expensive tiles average out. The
 load is further balanced by using many more tiles than threads, which is why
 the tile size is studied explicitly in Section~\ref{sec:results}.
 
+The same three arguments also express the other OpenMP schedules, which
+are compared in Section~\ref{sec:scheduling}: \texttt{static} (one
+contiguous block of $\lceil n/p\rceil$ tiles per thread),
+\texttt{static,}$c$ (blocks of $c$ tiles dealt round-robin to the threads)
+and \texttt{dynamic,}$c$ (blocks of $c$ tiles submitted as separate tasks:
+the executor's queue hands the next block to whichever thread becomes free,
+at the cost of one task submission per block).
+
 \subsection{Synchronization}
 
 By construction, every kernel here operates on disjoint output regions
 (rows or tiles), so the renderer itself is \textbf{lock-free}: no shared
 mutable accumulator is ever written by more than one thread, and no locks,
 atomics or critical sections are required.
+
+\paragraph{False sharing.} Disjoint regions do not guarantee disjoint cache
+lines: two threads writing neighbouring pixels can still invalidate each
+other's copy of a shared 64-byte line. Here this can only happen at region
+borders. A tile row is $32\times3\times4=384$ bytes, i.e.\ six whole cache
+lines, so two horizontally adjacent tiles share at most one line per pixel
+row, and only when the image buffer is not 64-byte aligned; image rows of
+the \texttt{pixels} kernel ($W\cdot 12$ bytes) behave the same way. In
+\texttt{simd} the contention is reduced further, because each tile is
+accumulated in private per-tile buffers and written to the shared image
+only once, at the end. False sharing is therefore limited to a few lines
+per tile and no padding was needed; the tile-size experiment
+(\S\ref{sec:tile}) would show it as a penalty for very small tiles, where
+borders make up a larger fraction of the writes.
+
+\subsection{Challenges and Solutions}
+
+\begin{itemize}[itemsep=1pt,topsep=2pt]
+  \item \textbf{Thread parallelism in Python.} With the GIL, Python threads
+    cannot run CPU-bound code in parallel. Using the free-threaded build of
+    Python~3.14 together with a Numba version that supports it made plain
+    \texttt{ThreadPoolExecutor} threads scale across cores; a control run
+    with the GIL re-enabled verifies this (\S\ref{sec:gil}).
+  \item \textbf{Preserving the painter's order.} Parallelizing over circles
+    would require ordering the blends on every pixel. Parallelizing over
+    pixels (rows or tiles) and sorting once, before the threads start, keeps
+    the order without any synchronization.
+  \item \textbf{Cost of the naive per-pixel kernel.} Testing every pixel
+    against every circle (\texttt{pixels}) is $O(H\cdot W\cdot N)$. Per-tile
+    culling (\texttt{tiles}) reduces each pixel's work to the circles that
+    can actually cover it.
+  \item \textbf{Getting the compiler to vectorize.} The first tiled kernel
+    has an early \texttt{continue} per circle inside the pixel loop, which
+    prevents auto-vectorization. Rewriting the inner loop as a countable,
+    branch-free loop over a small contiguous per-tile buffer (mask
+    $m\in\{0,1\}$ and a blend $m\cdot\text{new}+(1-m)\cdot\text{old}$)
+    let LLVM emit SIMD code.
+  \item \textbf{Load imbalance.} Circles of very different radii make the
+    work per tile irregular; it is handled with the interleaved tile
+    assignment, a large number of small tiles and, where useful, dynamic
+    scheduling (\S\ref{sec:scheduling}).
+  \item \textbf{Reaching a measurable workload.} The guideline of at least
+    10\,s of sequential time required raising the circle count of the
+    strong-scaling problem beyond the default range, to 60{,}000 circles.
+\end{itemize}
 
 \subsection{Data Structures and Memory Layout}
 
@@ -351,21 +401,35 @@ The default layout is SoA, as described above. For comparison, a
 \subsection{Environment}
 
 Benchmarks were executed on a lab server with an \textbf{AMD Ryzen~5 2400G}
-(x86-64, first-generation Zen, 3.6\,GHz base clock): 4 identical physical cores
-with simultaneous multithreading (SMT, 2 hardware threads per core), i.e.\
-8 logical cores. Each core has a private 32\,KB L1 data cache, the size the
-default tile (32$\times$32 pixels, whose three per-tile R/G/B buffers take
-12\,KB) was tuned for. The CPU supports AVX2 and FMA, so the vectorized kernel
+(x86-64, first-generation Zen, 3.6\,GHz base clock, 3.9\,GHz boost): 4
+identical physical cores with simultaneous multithreading (SMT, 2 hardware
+threads per core), i.e.\ 8 logical cores, and \tbd{RAM} of RAM assigned to
+the VM. Each core has a private 32\,KB L1 data cache and a private
+512\,KB L2 cache; the 4\,MB L3 cache is shared by all cores. The L1 size is
+the one the default tile (32$\times$32 pixels, whose three per-tile R/G/B
+buffers take 12\,KB) was tuned for. The CPU supports AVX2 and FMA, so the vectorized kernel
 operates on 256-bit vectors of 8 \texttt{float32}; note that Zen executes
 each 256-bit AVX2 instruction as two 128-bit halves. The machine runs Debian~13
 as a virtual machine on Proxmox. The software stack was the free-threaded build of
 Python 3.14.8 (GIL disabled), NumPy 2.5.3, Numba 0.68.0 and llvmlite 0.50.0
-on Linux, with the environment managed by \texttt{uv}. The maximum number of threads in
-the sweeps was deliberately set to \textbf{16}, i.e.\
-\emph{twice} the number of logical cores, so that the thread-scaling
-experiment can observe oversubscription behavior (thread count exceeding the
-logical core count) as required by the course guidelines~\cite{slides}, in addition to
-normal scaling up to the core count. Unlike a hybrid CPU, all cores run at
+on Linux, with the environment managed by \texttt{uv}. The ``compiler'' is
+Numba, which generates native code through LLVM~22.1 (bundled with
+llvmlite) for the host CPU; all kernels use \texttt{@njit(cache=True,
+fastmath=True)}, where \texttt{fastmath} allows floating-point
+reassociation and FMA contraction (needed for vectorization) and
+\texttt{cache} stores the compiled code on disk. Numba's own parallelism
+(\texttt{parallel=True}, \texttt{prange}) and \texttt{nogil=True} are not
+used: all parallelism comes from Python threads. CPU frequency scaling is
+managed by the Proxmox host and cannot be disabled from inside the VM
+\tbd{governor / boost status}; its effect is reduced by the warm-up runs
+and by repeating each measurement.
+
+The course guidelines~\cite{slides} ask for thread counts up to twice the
+number of physical cores (here 8). The sweeps go further, up to
+\textbf{16} threads, i.e.\ \emph{twice} the number of logical cores and
+four times the physical ones, so that the thread-scaling experiment can also
+observe oversubscription (thread count exceeding the logical core count), in
+addition to normal scaling up to the core count. Unlike a hybrid CPU, all cores run at
 the same speed, so the thread sweep has three clearly separated regimes:
 1--4 threads (one thread per physical core), 5--8 threads (two threads
 sharing the execution units of a physical core through SMT) and 9--16
@@ -380,29 +444,46 @@ deliberate choice rather than a limitation — for a 2D rasterizer,
 synthetically generated geometry \emph{is} the realistic workload, in the
 same way standard rasterization benchmarks use synthetic scenes rather than
 an external image dataset; there is no natural pre-existing dataset of
-``circles with depth and alpha'' to substitute.
+``circles with depth and alpha'' to substitute. Datasets are generated with
+a fixed seed, so every run uses the same circles. For the scheduling
+experiment only, a second variant draws the circle centers from a Gaussian
+centered on the image (standard deviation $1/8$ of the side), which
+concentrates the work in the middle tiles and makes it strongly unbalanced.
 
 \subsection{Methodology and Parameters}
 
 \begin{itemize}[itemsep=1pt,topsep=2pt]
-  \item \textbf{Timing:} wall-clock time via \texttt{time.perf\_counter}
-    equivalents, with a per-configuration time budget that stops adding
+  \item \textbf{Timing:} wall-clock time via \texttt{time.perf\_counter()}, with a per-configuration time budget that stops adding
     iterations once exceeded (bounding the cost of slow configurations), plus
-    CPU time (\texttt{time.process\_time()}, summed across threads) and an
-    approximate 95\% confidence interval ($1.96\cdot\sigma/\sqrt{n}$).
+    CPU time (\texttt{time.process\_time()}, summed across threads).
+  \item \textbf{Statistics:} for every configuration the script reports the
+    mean, sample standard deviation $\sigma$, minimum and maximum wall-clock
+    time, an approximate 95\% confidence interval of the mean
+    ($1.96\cdot\sigma/\sqrt{n}$) and the mean CPU time. Plots show the mean;
+    the speedup curves of the strong-scaling experiment carry the confidence
+    interval as error bars.
   \item \textbf{Warm-up:} each configuration is preceded by 2 warm-up runs
     (excluded from timing) to absorb Numba's JIT compilation cost; kernels are
-    also cached to disk (\texttt{@njit(cache=True)}) across runs.
+    also cached to disk (\texttt{@njit(cache=True)}) across runs. The
+    parallel kernels in the strong-scaling experiment use a single warm-up
+    run, since each execution already takes seconds.
   \item \textbf{Iterations:} 5 timed iterations per configuration (subject to
     the time budget).
   \item \textbf{Scaling dataset:} the strong-scaling experiment (\S\ref{sec:scaling})
     deliberately uses a large problem ($2048^2$ pixels, 60{,}000 circles) so
     that the sequential baseline takes $\ge 10\,$s, as required by the
     course's benchmarking guidelines~\cite{slides} for meaningful speedup measurements.
+  \item \textbf{Parameters tested:} threads 1, 2, 4, 8, 16; resolutions
+    $512^2$, $1024^2$, $2048^2$; 500--8000 circles (60{,}000 for strong
+    scaling); tile sides 16--256\,px; schedules \texttt{static},
+    \texttt{static,}\{1, 4, 16\} and \texttt{dynamic,}\{1, 4, 16\}; SoA
+    vs.\ AoS; GIL disabled vs.\ enabled.
   \item \textbf{Validation:} before any timing, the benchmark script renders
     the same scene with every kernel (\texttt{pixels}, \texttt{tiles},
-    \texttt{simd} and the AoS variant) at the maximum thread count and
-    compares each image with the sequential one. The check uses a tolerance
+    \texttt{simd} and the AoS variant, plus \texttt{simd} with the
+    \texttt{static}, \texttt{static,4} and \texttt{dynamic,4} schedules)
+    at the maximum thread count and compares each image with the sequential
+    one. The check uses a tolerance
     of $10^{-3}$ on the maximum absolute pixel difference rather than
     bit-exact equality, since \texttt{fastmath=True} permits floating-point
     reassociation, and it stops the run if any kernel exceeds it. Two cases
@@ -429,34 +510,44 @@ depth-sorted circles composited with the ``over'' operator.}
 Figure~\ref{fig:scaling} shows time, speedup and parallel efficiency versus
 thread count for a fixed, large problem ($2048^2$ pixels, 60{,}000 circles;
 sequential baseline: \tbd{T$_{\text{seq}}$}\,s). Table~\ref{tab:scaling} reports the same
-data for the \texttt{simd} kernel.
+data for the \texttt{simd} kernel. The \texttt{pixels} kernel, which has no
+culling, would be far too slow on this workload: it is measured on a smaller
+problem ($1024^2$ pixels, 8000 circles), only from 4 threads upwards, and its
+speedup is computed against a sequential run on that same smaller problem
+(\tbd{ms}); its efficiency uses the 4-thread run as baseline.
 
 \begin{figure*}[t]
 \centering
 \includegraphics[width=0.95\linewidth]{../figures/bench_scaling.png}
 \caption{Strong scaling: rendering time (log scale), speedup vs.\ the
 sequential baseline, and parallel efficiency, for all three parallel kernels,
-from 1 to 16 (oversubscribed) threads.}
+from 1 to 16 (oversubscribed) threads. \texttt{tiles} and \texttt{simd}:
+$2048^2$, 60{,}000 circles; \texttt{pixels}: $1024^2$, 8000 circles, 4--16
+threads, speedup relative to its own sequential baseline.}
 \label{fig:scaling}
 \end{figure*}
 
 \begin{table}[h]
 \centering
 \small
-\begin{tabular}{@{}rrrr@{}}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}rrrrrr@{}}
 \toprule
-\textbf{Threads} & \textbf{Time (ms)} & \textbf{Speedup} & \textbf{Efficiency} \\
+\textbf{$p$} & \textbf{Time (ms)} & \textbf{$\sigma$ (ms)} & \textbf{CPU (s)} & \textbf{Speedup} & \textbf{Eff.} \\
 \midrule
-1  & \tbd{} & \tbd{} & \tbd{} \\
-2  & \tbd{} & \tbd{} & \tbd{} \\
-4  & \tbd{} & \tbd{} & \tbd{} \\
-8  & \tbd{} & \tbd{} & \tbd{} \\
-16 & \tbd{} & \tbd{} & \tbd{} \\
+1  & \tbd{} & \tbd{} & \tbd{} & \tbd{} & \tbd{} \\
+2  & \tbd{} & \tbd{} & \tbd{} & \tbd{} & \tbd{} \\
+4  & \tbd{} & \tbd{} & \tbd{} & \tbd{} & \tbd{} \\
+8  & \tbd{} & \tbd{} & \tbd{} & \tbd{} & \tbd{} \\
+16 & \tbd{} & \tbd{} & \tbd{} & \tbd{} & \tbd{} \\
 \bottomrule
 \end{tabular}
 \caption{Strong scaling of the \texttt{simd} kernel on the 60{,}000-circle,
-$2048^2$ workload (speedup relative to the \tbd{T$_{\text{seq}}$}\,s sequential baseline;
-efficiency here is $\text{speedup}/p$).}
+$2048^2$ workload: mean wall-clock time, its sample standard deviation,
+mean CPU time summed over all threads, speedup relative to the
+\tbd{T$_{\text{seq}}$}\,s sequential baseline and efficiency
+($\text{speedup}/p$). Min/max and confidence intervals are printed by the
+benchmark script.}
 \label{tab:scaling}
 \end{table}
 
@@ -475,6 +566,35 @@ while adding SIMD on top pushes the maximum speedup to \tbd{S$_{\max}$}. On this
 dense workload (60{,}000 large circles) each tile has a long candidate list,
 so \texttt{tiles} tests many circles per pixel, whereas \texttt{seq} only
 visits the pixels inside each circle's bounding box.
+
+The CPU time column gives a direct check of how many cores are really
+busy: the ratio CPU time / wall-clock time is \tbd{X} at $p{=}4$,
+\tbd{X} at $p{=}8$ and \tbd{X} at $p{=}16$. % DA VERIFICARE: se a 16 il
+% rapporto resta ~8, i thread in più aspettano e non consumano CPU.
+\tbd{interpretation: a ratio close to $p$ means all threads compute; a ratio
+that stops at about 8 beyond 8 threads means the extra threads only wait for
+a free logical core}.
+
+\subsection{Speedup for Different Input Sizes}
+\label{sec:sizes}
+
+Figure~\ref{fig:sizes} repeats the thread sweep for the \texttt{simd}
+kernel on three image sizes ($512^2$, $1024^2$, $2048^2$, 3000 circles),
+each against its own sequential baseline. \tbd{how the speedup changes
+with the size of the problem}.
+% Chiave di lettura attesa: sull'immagine piccola il lavoro per thread è
+% poco e i costi fissi (ordinamento, allocazione, invio dei task, join)
+% pesano di più, quindi lo speedup satura prima; sulle immagini grandi le
+% curve si avvicinano a quella dello strong scaling.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{../figures/bench_speedup_sizes.png}
+\caption{Speedup of \texttt{simd} vs.\ thread count for three image
+sizes (3000 circles), each relative to the sequential kernel on the same
+input.}
+\label{fig:sizes}
+\end{figure}
 
 \subsection{Effect of Resolution and Circle Count}
 
@@ -508,6 +628,7 @@ grow long, the same effect seen in the strong-scaling experiment.
 \end{figure}
 
 \subsection{Effect of Tile Size}
+\label{sec:tile}
 
 Figure~\ref{fig:tile} sweeps the tile side length from 16 to 256 pixels
 (1024$^2$ image, 4000 circles, 16 threads). \texttt{simd} is fastest at
@@ -528,6 +649,41 @@ faster than \texttt{tiles} across the whole sweep. % DA VERIFICARE sul grafico
 \texttt{simd} kernels.}
 \label{fig:tile}
 \end{figure}
+
+\subsection{Scheduling Strategies}
+\label{sec:scheduling}
+
+Figure~\ref{fig:scheduling} compares the ways of distributing the tiles
+among threads (\S\ref{sec:nogil}) for \texttt{simd} ($1024^2$, 4000
+circles, i.e.\ 1024 tiles of 32$\times$32), at 8 and 16 threads, on two
+datasets: the usual uniform one, and one with the circles concentrated in
+the center of the image, where the work per tile is strongly unbalanced.
+\tbd{results on the uniform dataset: are the schedules close to each
+other?}. \tbd{results on the concentrated dataset: \texttt{static} vs.\
+\texttt{static,1} vs.\ \texttt{dynamic}; best schedule and chunk size}.
+% Sul Mac (prova veloce) con i cerchi concentrati: static ~35 ms,
+% static,4 ~33 ms, static,1 ~24 ms, dynamic,4 ~20 ms a 8 thread.
+% DA VERIFICARE sul server.
+With \texttt{static} each thread receives a contiguous band of tile rows,
+so the threads that get the middle of the image do most of the work while
+the others finish early. Chunk size interacts with the image geometry: with
+32 tiles per row, 8 threads and chunks of 4 tiles, $8\cdot4=32$, so each
+thread always receives the same four tile columns in every row and the
+central columns again end up on the same few threads; \texttt{static,1}
+and \texttt{static,16} do not have this alignment. \texttt{dynamic}
+balances the load at run time, regardless of where the work is, at the cost
+of one task submission per chunk: with chunk 1 this overhead is paid 1024
+times per frame, which is why \tbd{dynamic,1 vs.\ dynamic,4/16}.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.9\linewidth]{../figures/bench_scheduling.png}
+\caption{Rendering time of \texttt{simd} for each scheduling strategy,
+at 8 and 16 threads ($1024^2$, 4000 circles). Left: uniformly distributed
+circles; right: circles concentrated in the center of the image (unbalanced
+work per tile).}
+\label{fig:scheduling}
+\end{figure*}
 
 \subsection{Effect of SIMD (Scalar vs.\ Vectorized)}
 
@@ -571,11 +727,13 @@ not across circles, the circle layout would have almost no effect.
 layout wins consistently}.
 % Sull'M2 nessuno dei due vinceva in modo consistente (differenze 6-15% di
 % segno alterno): se il server conferma, la frase sotto resta valida.
-This is expected for this workload: circle attributes are read
-once per tile-candidate-test and once per pixel hit, not streamed
-sequentially over the whole array in a tight loop, so the unit-stride
-advantage of SoA is largely hidden by the small candidate-list sizes and by
-cache residency of the per-tile working set — the memory-layout choice
+This is expected for this workload: although the attributes are read for
+every candidate circle at every pixel, the access goes through the candidate
+list (an indirect, gather-like access, $k=\texttt{cand}[c]$), not a
+unit-stride stream over the whole array, and the candidates of a tile are few
+enough that their attributes stay in L1 across the pixels of the tile in
+either layout. The unit-stride advantage of SoA is therefore largely hidden,
+and the memory-layout choice
 matters far less here than it would for a bulk, streaming numerical kernel.
 
 \begin{figure}[t]
@@ -686,6 +844,30 @@ limits on performance:
     confirmed by the lack of a consistent SoA/AoS difference).
 \end{itemize}
 
+\subsection{Limitations}
+
+\begin{itemize}[itemsep=1pt,topsep=2pt]
+  \item \textbf{Small machine.} With 4 physical cores the scaling study
+    covers only a short range of real parallelism; beyond 4 threads the
+    results measure SMT and oversubscription rather than additional cores.
+  \item \textbf{Virtualized, shared environment.} The server is a Proxmox VM
+    shared with other users: frequency scaling and the scheduling of the
+    virtual CPUs are controlled by the host and can add noise, which the
+    warm-up, repetitions and confidence intervals only partially absorb.
+  \item \textbf{Synthetic data.} Circles are uniformly distributed except
+    in the scheduling experiment; real scenes may be more clustered, which
+    would make load balancing more important.
+  \item \textbf{Serial part.} Sorting and image allocation remain
+    sequential (\S\ref{sec:results}, Amdahl); for much larger circle counts
+    the sort would also need to be parallelized.
+  \item \textbf{Indirect control of vectorization.} SIMD code is produced by
+    Numba/LLVM auto-vectorization, not by explicit intrinsics: small changes
+    to the inner loop can silently disable it, and the vector width is
+    chosen by the compiler.
+  \item \textbf{Fixed tile size.} One tile size (32\,px) is used for every
+    image; dense or sparse regions might benefit from different sizes.
+\end{itemize}
+
 %==================================================================
 \section{Conclusions}
 
@@ -704,6 +886,14 @@ Memory layout (SoA vs.\ AoS) had a comparatively minor effect,
 consistent with a workload whose bottleneck is irregular per-tile work rather
 than memory bandwidth. \tbd{one-sentence summary of strong and weak scaling
 across the physical-core, SMT and oversubscription regimes}.
+
+\textbf{Best configuration found:} the \texttt{simd} kernel with SoA
+layout, 32$\times$32 tiles, \tbd{schedule} scheduling and \tbd{p}
+threads, which renders the 60{,}000-circle $2048^2$ scene in \tbd{ms}
+instead of the \tbd{T$_{\text{seq}}$}\,s of the sequential kernel
+(speedup \tbd{S$_{\max}$}). On a uniform scene the default interleaved
+assignment (\texttt{static,1}) is \tbd{as good as / slightly worse than}
+dynamic scheduling; on unbalanced scenes \tbd{schedule} is preferable.
 
 Future work could explore spatial acceleration structures (e.g.\ a
 tile-local BVH or grid over circles for very high circle counts), GPU
